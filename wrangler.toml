@@ -21,7 +21,7 @@ bucket_name = "docshare"
 # then paste the returned id below.
 [[kv_namespaces]]
 binding = "QUOTA"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "38dad3d1516a4240b5625b0ae276ad91"
 
 # Per-IP burst rate limiters. period must be 10 or 60 (seconds).
 [[unsafe.bindings]]
@@ -57,7 +57,7 @@ MAX_DOC_BYTES = "104857600"        # 100 MB, docs
 DOC_DAILY_COUNT = "5"              # docs per IP per day
 DOC_DAILY_BYTES = "314572800"      # 300 MB per IP per day
 R2_BUCKET_NAME = "docshare"        # used by the S3 presigner
-R2_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+R2_ACCOUNT_ID = "467d682e615fa1070ddac20ca0b9e21b"
 
 # Secrets (set via `wrangler secret put` — DO NOT put real values here):
 #   GEMINI_API_KEY        (optional; OCR is disabled if unset)

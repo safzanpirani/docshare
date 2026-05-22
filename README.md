@@ -46,21 +46,10 @@ Without this, uploads are never deleted.
 
 ### 3. Bucket CORS (so the browser can PUT direct to R2)
 The presigned upload is a cross-origin PUT from `docs.safzan.dev` to the R2 S3
-endpoint, so the bucket needs a CORS policy. Save this as `cors.json`:
-```json
-[
-  {
-    "AllowedOrigins": ["https://docs.safzan.dev"],
-    "AllowedMethods": ["PUT", "GET", "HEAD"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3600
-  }
-]
-```
-Apply it (or set it in the dashboard → R2 → docshare → Settings → CORS policy):
+endpoint, so the bucket needs a CORS policy. It's in `cors.json` (wrangler's
+`{ "rules": [...] }` schema). Apply it:
 ```sh
-npx wrangler r2 bucket cors put docshare --file cors.json
+npx wrangler r2 bucket cors set docshare --file cors.json
 ```
 
 ### 4. KV namespace for daily quotas
