@@ -1,0 +1,65 @@
+name = "docshare"
+main = "src/index.ts"
+compatibility_date = "2025-01-15"
+
+# Custom domain — bind docs.safzan.dev to this Worker.
+# Requires the safzan.dev zone to exist on this Cloudflare account.
+[[routes]]
+pattern = "docs.safzan.dev"
+custom_domain = true
+
+# R2 bucket holding img/{id}.webp, doc/{id}, and meta/{id}.json objects.
+# Separate from the seeshare bucket so share.safzan.dev is untouched.
+# Configure a lifecycle rule on this bucket to delete objects older than 1 day
+# (instructions in README). The lifecycle rule is what enforces the TTL.
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "docshare"
+
+# KV namespace for per-IP daily doc quotas (count + bytes per day).
+# Create with: npx wrangler kv namespace create QUOTA
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "QUOTA"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Per-IP burst rate limiters. period must be 10 or 60 (seconds).
+[[unsafe.bindings]]
+name = "UPLOAD_LIMITER"
+type = "ratelimit"
+namespace_id = "2001"
+simple = { limit = 6, period = 60 }
+
+[[unsafe.bindings]]
+name = "DOC_LIMITER"
+type = "ratelimit"
+namespace_id = "2002"
+simple = { limit = 2, period = 60 }
+
+[[unsafe.bindings]]
+name = "OCR_LIMITER"
+type = "ratelimit"
+namespace_id = "2003"
+simple = { limit = 3, period = 60 }
+
+# Allow `import indexHtml from '../public/index.html'`
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = true
+
+[vars]
+PUBLIC_ORIGIN = "https://docs.safzan.dev"
+TTL_HOURS = "24"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+MAX_UPLOAD_BYTES = "15728640"      # 15 MB, images (webp)
+MAX_DOC_BYTES = "104857600"        # 100 MB, docs
+DOC_DAILY_COUNT = "5"              # docs per IP per day
+DOC_DAILY_BYTES = "314572800"      # 300 MB per IP per day
+R2_BUCKET_NAME = "docshare"        # used by the S3 presigner
+R2_ACCOUNT_ID = "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID"
+
+# Secrets (set via `wrangler secret put` — DO NOT put real values here):
+#   GEMINI_API_KEY        (optional; OCR is disabled if unset)
+#   R2_ACCESS_KEY_ID      (R2 S3-API token — dashboard → R2 → Manage R2 API Tokens)
+#   R2_SECRET_ACCESS_KEY

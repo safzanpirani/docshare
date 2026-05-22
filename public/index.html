@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>docshare · share files & images with coding agents</title>
+<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤100MB) gets a short download URL. Auto-deletes in 24h." />
+<meta name="color-scheme" content="dark" />
+<style>
+  :root {
+    --bg: #0b0a10;
+    --bg-card: #14121c;
+    --bg-card-hover: #1b1827;
+    --border: #26222f;
+    --border-strong: #38324a;
+    --text: #e9e7f0;
+    --text-dim: #8d87a0;
+    --text-faint: #565070;
+    --accent: #a78bfa;
+    --accent-soft: rgba(167, 139, 250, 0.10);
+    --accent-fg: #160f2e;
+    --danger: #ef4444;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, monospace;
+    --radius: 4px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(900px 400px at 90% -10%, rgba(167,139,250,0.07), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, .mono, .url, .kbd { font-family: var(--mono); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font-family: inherit; font-size: inherit; cursor: pointer; }
+  main { max-width: 680px; margin: 0 auto; padding: 48px 20px 80px; }
+  header { margin-bottom: 36px; display: flex; align-items: center; gap: 12px; }
+  .logo-mark {
+    width: 28px; height: 28px; border-radius: 6px;
+    background: var(--accent); color: var(--accent-fg);
+    display: grid; place-items: center;
+    font-family: var(--mono); font-weight: 700; font-size: 14px; letter-spacing: -0.04em;
+  }
+  .logo-text { display: flex; flex-direction: column; line-height: 1.2; }
+  .logo { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+  .tagline { color: var(--text-dim); font-size: 12px; }
+
+  /* drop zone */
+  .drop {
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 52px 24px; text-align: center; cursor: pointer;
+    transition: border-color .15s, background .15s, box-shadow .15s;
+    background: var(--bg-card); user-select: none; position: relative;
+  }
+  .drop:hover { border-color: var(--border-strong); background: var(--bg-card-hover); }
+  .drop.is-drag {
+    border-color: var(--accent); background: var(--accent-soft);
+    box-shadow: 0 0 0 4px rgba(167,139,250,0.10);
+  }
+  .drop.is-busy { opacity: .7; pointer-events: none; }
+  .drop-title { font-size: 15px; font-weight: 500; }
+  .drop-title .kbd {
+    display: inline-block; padding: 1px 6px; border: 1px solid var(--border-strong);
+    border-radius: 3px; font-size: 11px; color: var(--text); background: #221d33; margin: 0 2px;
+  }
+  .drop-sub { color: var(--text-dim); font-size: 12px; margin-top: 14px; font-family: var(--mono); }
+  .drop-status { margin-top: 16px; color: var(--accent); font-size: 12px; min-height: 1em; font-family: var(--mono); }
+  .drop-status.error { color: var(--danger); }
+  .progress {
+    margin: 14px auto 0; max-width: 320px; height: 6px; border-radius: 99px;
+    background: #221d33; overflow: hidden; display: none;
+  }
+  .progress.show { display: block; }
+  .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+
+  /* recent */
+  .recent-head { display: flex; align-items: center; justify-content: space-between; margin: 40px 0 14px; padding: 0 2px; }
+  .recent-head .label {
+    font-size: 11px; letter-spacing: 0.18em; color: var(--text-dim); font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .recent-head .label::before { content: ""; width: 6px; height: 6px; background: var(--accent); border-radius: 50%; }
+  .recent-head .count { font-size: 11px; color: var(--text-dim); font-family: var(--mono); }
+  .recent { display: flex; flex-direction: column; gap: 10px; }
+  .item {
+    display: grid; grid-template-columns: 1fr 110px; gap: 16px; padding: 14px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+    transition: border-color .15s, background .15s;
+  }
+  .item:hover { border-color: var(--border-strong); background: var(--bg-card-hover); }
+  .thumb {
+    width: 110px; height: 110px; border-radius: 6px; overflow: hidden; background: #000;
+    display: grid; place-items: center; grid-column: 2; grid-row: 1;
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb.doc { background: #1b1827; color: var(--text-dim); }
+  .thumb.doc .ext {
+    font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.02em; margin-top: 8px; word-break: break-all; padding: 0 6px;
+  }
+  .item-body { display: flex; flex-direction: column; gap: 10px; min-width: 0; grid-column: 1; grid-row: 1; }
+  .fname { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .url-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    background: #0f0d16; border: 1px solid var(--border); border-radius: 6px;
+  }
+  .url { flex: 1; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; }
+  .url-copy { background: transparent; border: none; color: var(--text-dim); padding: 2px; display: grid; place-items: center; border-radius: 3px; }
+  .url-copy:hover { color: var(--accent); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .btn {
+    border: 1px solid var(--border-strong); background: transparent; color: var(--text);
+    padding: 6px 11px; border-radius: 5px; font-family: var(--mono); font-size: 11.5px;
+    display: inline-flex; align-items: center; gap: 6px; transition: background .12s, border-color .12s, color .12s;
+  }
+  .btn:hover { background: #201b30; border-color: #4a4264; color: var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
+  .btn.primary:hover { background: #b9a3fb; border-color: #b9a3fb; color: var(--accent-fg); }
+  .btn[disabled] { opacity: .5; cursor: not-allowed; }
+  .btn .ico { width: 12px; height: 12px; }
+  .meta { color: var(--text-dim); font-size: 11px; margin-top: auto; font-family: var(--mono); }
+  .meta .exp { color: var(--text); }
+  .meta .sep { margin: 0 6px; color: var(--text-faint); }
+  .empty { color: var(--text-faint); font-size: 12px; text-align: center; padding: 24px 0; }
+
+  /* OCR modal */
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.78); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+  .modal-back.open { display: flex; }
+  .modal {
+    background: var(--bg-card); border: 1px solid var(--border-strong); border-top: 2px solid var(--accent);
+    border-radius: 10px; width: 100%; max-width: 560px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .modal-title { font-size: 11px; letter-spacing: 0.18em; font-weight: 600; color: var(--text); }
+  .modal-title .badge {
+    font-size: 10px; color: var(--accent); margin-left: 10px; padding: 2px 7px;
+    border: 1px solid var(--accent); border-radius: 3px; font-family: var(--mono); letter-spacing: 0; font-weight: 500;
+  }
+  .modal-body { padding: 14px 16px; overflow: auto; flex: 1; }
+  .modal-text { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; color: var(--text); line-height: 1.55; }
+  .modal-foot { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+  .icon-btn { background: transparent; border: none; color: var(--text-dim); padding: 4px; border-radius: 4px; display: grid; place-items: center; }
+  .icon-btn:hover { color: var(--accent); background: var(--bg-card-hover); }
+
+  footer { margin-top: 64px; text-align: center; color: var(--text-faint); font-size: 11px; font-family: var(--mono); }
+  footer a { color: var(--text-dim); }
+  footer a:hover { color: var(--accent); }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: #201b30; border: 1px solid var(--accent); color: var(--text); padding: 8px 14px;
+    border-radius: 6px; font-family: var(--mono); font-size: 12px; opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; z-index: 200;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="logo-mark">ds</div>
+    <div class="logo-text">
+      <div class="logo">docshare</div>
+      <div class="tagline">paste, drop, or pick anything · 24h auto-delete</div>
+    </div>
+  </header>
+
+  <div id="drop" class="drop" tabindex="0" role="button" aria-label="Upload file or image">
+    <div class="drop-title">
+      <span class="kbd">⌘V</span> / <span class="kbd">Ctrl+V</span> to paste · drag &amp; drop · or click to browse
+    </div>
+    <div class="drop-sub">images → WebP · any file ≤ 100 MB · 24h TTL · sent straight to storage</div>
+    <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
+    <div id="drop-status" class="drop-status"></div>
+  </div>
+  <input id="file-input" type="file" hidden />
+
+  <div class="recent-head">
+    <div class="label">RECENT</div>
+    <div id="recent-count" class="count">0 links</div>
+  </div>
+  <div id="recent" class="recent"></div>
+  <div id="recent-empty" class="empty">no uploads yet — paste or drop something above</div>
+
+  <footer>
+    docshare · 24h TTL · <a href="#" id="clear-recent">clear local history</a>
+  </footer>
+</main>
+
+<div id="modal" class="modal-back" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title" id="modal-title">OCR<span class="badge" id="modal-badge"></span></div>
+      <button class="icon-btn" id="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body"><pre class="modal-text" id="modal-text"></pre></div>
+    <div class="modal-foot"><button class="btn" id="modal-copy">copy text</button></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  const MAX_IMAGE_BYTES = 15 * 1024 * 1024
+  const MAX_DOC_BYTES = 100 * 1024 * 1024
+  const MAX_DIMENSION = 4096
+  const RECENT_KEY = 'docshare.recent'
+  const MAX_RECENT = 20
+
+  const $ = (id) => document.getElementById(id)
+  const drop = $('drop')
+  const fileInput = $('file-input')
+  const dropStatus = $('drop-status')
+  const progress = $('progress')
+  const progressBar = $('progress-bar')
+  const recent = $('recent')
+  const recentEmpty = $('recent-empty')
+  const recentCount = $('recent-count')
+  const toastEl = $('toast')
+  const modal = $('modal')
+  const modalText = $('modal-text')
+  const modalBadge = $('modal-badge')
+
+  // ----- toast -----
+  let toastTimer
+  function toast(msg) {
+    toastEl.textContent = msg
+    toastEl.classList.add('show')
+    clearTimeout(toastTimer)
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1600)
+  }
+
+  // ----- recent storage -----
+  function loadRecent() {
+    try {
+      const raw = localStorage.getItem(RECENT_KEY)
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      return Array.isArray(parsed) ? parsed : []
+    } catch { return [] }
+  }
+  function saveRecent(items) { localStorage.setItem(RECENT_KEY, JSON.stringify(items.slice(0, MAX_RECENT))) }
+  function pushRecent(item) {
+    const items = loadRecent().filter((x) => x.id !== item.id)
+    items.unshift(item)
+    saveRecent(items)
+    renderRecent()
+  }
+  function updateRecent(id, patch) {
+    const items = loadRecent().map((x) => (x.id === id ? { ...x, ...patch } : x))
+    saveRecent(items)
+    renderRecent()
+  }
+  function removeExpired() {
+    const now = Date.now()
+    saveRecent(loadRecent().filter((x) => x.expiresAt > now))
+  }
+
+  // ----- formatters -----
+  function expiresLabel(ms) {
+    const diff = ms - Date.now()
+    if (diff <= 0) return 'expired'
+    const m = Math.floor(diff / 60000)
+    if (m < 60) return `expires in ${m}m`
+    const h = Math.floor(m / 60)
+    if (h < 24) return `expires in ${h}h`
+    return `expires in ${Math.floor(h / 24)}d`
+  }
+  function fmtUploadedAt(ms) {
+    const d = new Date(ms)
+    const date = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    const time = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' })
+    return `${date}, ${time} UTC`
+  }
+  function fmtSize(bytes) {
+    if (!bytes) return ''
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB'
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+  }
+  function extOf(name) {
+    const m = /\.([a-z0-9]+)$/i.exec(name || '')
+    return m ? m[1] : 'file'
+  }
+
+  // ----- copy helper -----
+  async function copy(text, msg = 'copied') {
+    try {
+      await navigator.clipboard.writeText(text)
+      toast(msg)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      ta.remove()
+      toast(msg)
+    }
+  }
+
+  // ----- render recent -----
+  function renderRecent() {
+    removeExpired()
+    const items = loadRecent()
+    recentCount.textContent = items.length === 1 ? '1 link' : `${items.length} links`
+    recentEmpty.style.display = items.length === 0 ? '' : 'none'
+    recent.innerHTML = ''
+    for (const item of items) recent.appendChild(itemEl(item))
+  }
+
+  function itemEl(item) {
+    const isDoc = item.kind === 'doc'
+    const el = document.createElement('div')
+    el.className = 'item'
+    el.dataset.id = item.id
+
+    // thumb
+    const thumb = document.createElement('div')
+    if (isDoc) {
+      thumb.className = 'thumb doc'
+      thumb.innerHTML = svgFile() + `<div class="ext">${extOf(item.filename)}</div>`
+    } else {
+      thumb.className = 'thumb'
+      const img = document.createElement('img')
+      img.src = item.url; img.alt = ''; img.loading = 'lazy'
+      thumb.appendChild(img)
+    }
+    el.appendChild(thumb)
+
+    const body = document.createElement('div')
+    body.className = 'item-body'
+
+    if (isDoc) {
+      const fname = document.createElement('div')
+      fname.className = 'fname'
+      fname.textContent = item.filename || item.id
+      fname.title = item.filename || item.id
+      body.appendChild(fname)
+    }
+
+    // URL row
+    const urlRow = document.createElement('div')
+    urlRow.className = 'url-row'
+    const urlEl = document.createElement('div')
+    urlEl.className = 'url'
+    urlEl.textContent = item.url
+    urlRow.appendChild(urlEl)
+    const urlCopy = document.createElement('button')
+    urlCopy.className = 'url-copy'; urlCopy.title = 'copy URL'; urlCopy.innerHTML = svgCopy()
+    urlCopy.addEventListener('click', () => copy(item.url, 'URL copied'))
+    urlRow.appendChild(urlCopy)
+    body.appendChild(urlRow)
+
+    // actions
+    const actions = document.createElement('div')
+    actions.className = 'actions'
+
+    const promptBtn = document.createElement('button')
+    promptBtn.className = 'btn primary'
+    promptBtn.innerHTML = `${svgCopy()} Prompt`
+    promptBtn.addEventListener('click', () => {
+      const line = isDoc
+        ? `Download and read this file: ${item.url}`
+        : `Look at this image: ${item.url}`
+      copy(line, 'prompt copied')
+    })
+    actions.appendChild(promptBtn)
+
+    if (isDoc) {
+      const dl = document.createElement('a')
+      dl.className = 'btn'
+      dl.href = item.url
+      dl.innerHTML = `${svgDownload()} Download`
+      actions.appendChild(dl)
+    } else {
+      const ocrBtn = document.createElement('button')
+      ocrBtn.className = 'btn'
+      ocrBtn.innerHTML = `${svgScan()} OCR`
+      ocrBtn.addEventListener('click', () => runOcrFor(item, ocrBtn))
+      actions.appendChild(ocrBtn)
+    }
+
+    const curlBtn = document.createElement('button')
+    curlBtn.className = 'btn'
+    curlBtn.innerHTML = `${svgCopy()} cURL`
+    curlBtn.addEventListener('click', () => {
+      const cmd = isDoc
+        ? `curl -L -o "${item.filename || item.id}" ${item.url}`
+        : `curl -o ${item.id}.webp ${item.url}`
+      copy(cmd, 'cURL copied')
+    })
+    actions.appendChild(curlBtn)
+    body.appendChild(actions)
+
+    // meta
+    const meta = document.createElement('div')
+    meta.className = 'meta'
+    const sizePart = item.size ? `<span class="sep">·</span>${fmtSize(item.size)}` : ''
+    meta.innerHTML = `<span class="exp">${expiresLabel(item.expiresAt)}</span>${sizePart}<span class="sep">·</span>${fmtUploadedAt(item.uploadedAt)}`
+    body.appendChild(meta)
+
+    el.appendChild(body)
+    return el
+  }
+
+  function svgCopy() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' }
+  function svgScan() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>' }
+  function svgDownload() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' }
+  function svgFile() { return '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' }
+
+  // ----- OCR (images only) -----
+  let ocrModalOwner = null
+  async function runOcrFor(item, btn) {
+    if (item.ocr) { showOcr(item.ocr.text, 'cached locally'); return }
+    btn.disabled = true
+    btn.innerHTML = `${svgScan()} ...`
+    try {
+      const res = await fetch(`/api/ocr/${item.id}`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'ocr failed')
+      updateRecent(item.id, { ocr: { text: data.text, ranAt: data.ranAt, cached: data.cached } })
+      showOcr(data.text, data.cached ? 'cached' : `model: ${data.model || 'gemini'}`)
+    } catch (e) {
+      toast(`OCR failed: ${e.message}`)
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = `${svgScan()} OCR`
+    }
+  }
+  function showOcr(text, badge) {
+    modalText.textContent = text || '(no text detected)'
+    modalBadge.textContent = badge || ''
+    modal.classList.add('open')
+    ocrModalOwner = text
+  }
+  $('modal-close').addEventListener('click', () => modal.classList.remove('open'))
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.remove('open') })
+  $('modal-copy').addEventListener('click', () => { if (ocrModalOwner) copy(ocrModalOwner, 'text copied') })
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') modal.classList.remove('open') })
+
+  // ----- WebP conversion (with iOS Safari fallback) -----
+  async function isWebpBlob(blob) {
+    if (!blob || blob.size < 12) return false
+    const head = new Uint8Array(await blob.slice(0, 12).arrayBuffer())
+    return head[0]===0x52 && head[1]===0x49 && head[2]===0x46 && head[3]===0x46 &&
+           head[8]===0x57 && head[9]===0x45 && head[10]===0x42 && head[11]===0x50
+  }
+  let jsWebpPromise = null
+  async function jsWebpEncoder() {
+    if (!jsWebpPromise) {
+      jsWebpPromise = import('https://esm.sh/@jsquash/webp@1.4.0').then(async (m) => {
+        if (typeof m.init === 'function') { try { await m.init() } catch {} }
+        return m
+      })
+    }
+    return jsWebpPromise
+  }
+  async function toWebp(file) {
+    let bitmap
+    try { bitmap = await createImageBitmap(file) }
+    catch { throw new Error('cannot decode image') }
+
+    let { width, height } = bitmap
+    if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+      const scale = MAX_DIMENSION / Math.max(width, height)
+      width = Math.round(width * scale)
+      height = Math.round(height * scale)
+    }
+    const canvas = Object.assign(document.createElement('canvas'), { width, height })
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(bitmap, 0, 0, width, height)
+    bitmap.close?.()
+
+    let nativeBroken = false
+    const nativeEncode = (q) => new Promise((res) => canvas.toBlob((b) => res(b), 'image/webp', q))
+    const jsEncode = async (q) => {
+      setStatus('compressing on device…')
+      const mod = await jsWebpEncoder()
+      const imageData = ctx.getImageData(0, 0, width, height)
+      const buffer = await mod.encode(imageData, { quality: Math.round(q * 100) })
+      return new Blob([buffer], { type: 'image/webp' })
+    }
+    const encode = async (q) => {
+      if (!nativeBroken) {
+        const blob = await nativeEncode(q)
+        if (blob && blob.type === 'image/webp' && await isWebpBlob(blob)) return blob
+        nativeBroken = true
+      }
+      return jsEncode(q)
+    }
+
+    let q = 0.92
+    let blob = await encode(q)
+    while (blob.size > MAX_IMAGE_BYTES && q > 0.4) {
+      q = Math.max(0.4, q - 0.1)
+      blob = await encode(q)
+    }
+    if (blob.size > MAX_IMAGE_BYTES) throw new Error('image too large after compression')
+    return blob
+  }
+
+  // ----- image upload (through Worker) -----
+  async function uploadImage(file) {
+    setStatus('converting to WebP…')
+    const webp = await toWebp(file)
+    setStatus(`uploading ${(webp.size / 1024).toFixed(0)} KB…`)
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'image/webp' },
+      body: webp,
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      const err = data.error || `http ${res.status}`
+      if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
+      if (err === 'too_large') throw new Error('too large after compression')
+      throw new Error(err)
+    }
+    pushRecent({ kind: 'image', id: data.id, url: data.url, uploadedAt: data.uploadedAt, expiresAt: data.expiresAt, size: data.size })
+    copy(data.url, 'uploaded · URL copied')
+    setStatus('')
+  }
+
+  // ----- doc upload (presigned, direct to R2) -----
+  function putWithProgress(url, file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('PUT', url)
+      if (file.type) xhr.setRequestHeader('content-type', file.type)
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total) }
+      xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(new Error(`upload failed (${xhr.status})`))
+      xhr.onerror = () => reject(new Error('network error during upload'))
+      xhr.send(file)
+    })
+  }
+  async function uploadDoc(file) {
+    if (file.size > MAX_DOC_BYTES) throw new Error('file too large (100 MB max)')
+    setStatus('preparing upload…')
+    const presignRes = await fetch('/api/doc/presign', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, size: file.size, contentType: file.type || 'application/octet-stream' }),
+    })
+    const presign = await presignRes.json()
+    if (!presignRes.ok) {
+      const err = presign.error || `http ${presignRes.status}`
+      if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
+      if (err === 'daily_count') throw new Error('daily upload limit reached')
+      if (err === 'daily_bytes') throw new Error('daily size limit reached')
+      if (err === 'too_large') throw new Error('file too large (100 MB max)')
+      throw new Error(err)
+    }
+
+    progress.classList.add('show')
+    progressBar.style.width = '0%'
+    setStatus(`uploading ${fmtSize(file.size)}…`)
+    try {
+      await putWithProgress(presign.putUrl, file, (frac) => {
+        const pct = Math.round(frac * 100)
+        progressBar.style.width = pct + '%'
+        setStatus(`uploading ${pct}%…`)
+      })
+    } finally {
+      progress.classList.remove('show')
+    }
+
+    // confirm + enforce real size (best-effort)
+    try {
+      await fetch('/api/doc/finalize', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: presign.id }),
+      })
+    } catch {}
+
+    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: file.size })
+    copy(presign.downloadUrl, 'uploaded · URL copied')
+    setStatus('')
+  }
+
+  // ----- dispatch -----
+  async function handleFile(file) {
+    if (!file) return
+    drop.classList.add('is-busy')
+    try {
+      if (file.type && file.type.startsWith('image/')) {
+        try { await uploadImage(file); return }
+        catch (e) {
+          if (!(e && e.message === 'cannot decode image')) throw e
+          // undecodable image (e.g. some HEIC on desktop) — fall back to doc
+        }
+      }
+      await uploadDoc(file)
+    } catch (e) {
+      setStatus(e.message || 'upload failed', true)
+    } finally {
+      drop.classList.remove('is-busy')
+    }
+  }
+
+  function setStatus(msg, isErr) {
+    dropStatus.textContent = msg
+    dropStatus.classList.toggle('error', !!isErr)
+  }
+
+  // ----- input wiring -----
+  drop.addEventListener('click', () => fileInput.click())
+  drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click() } })
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files?.[0]
+    if (f) handleFile(f)
+    fileInput.value = ''
+  })
+  ;['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('is-drag') }))
+  ;['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('is-drag') }))
+  drop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer?.files?.[0]
+    if (f) handleFile(f)
+  })
+  window.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    for (const it of items) {
+      if (it.kind === 'file') {
+        const f = it.getAsFile()
+        if (f) { handleFile(f); break }
+      }
+    }
+  })
+
+  $('clear-recent').addEventListener('click', (e) => {
+    e.preventDefault()
+    if (confirm('clear local upload history? (does not delete uploads from server)')) {
+      localStorage.removeItem(RECENT_KEY)
+      renderRecent()
+    }
+  })
+
+  setInterval(() => {
+    document.querySelectorAll('.item').forEach((el) => {
+      const item = loadRecent().find((x) => x.id === el.dataset.id)
+      if (!item) return
+      const exp = el.querySelector('.exp')
+      if (exp) exp.textContent = expiresLabel(item.expiresAt)
+    })
+  }, 30000)
+
+  renderRecent()
+})()
+</script>
+</body>
+</html>
