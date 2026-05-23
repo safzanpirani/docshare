@@ -42,10 +42,10 @@ type = "ratelimit"
 namespace_id = "2003"
 simple = { limit = 3, period = 60 }
 
-# Allow `import indexHtml from '../public/index.html'`
+# Allow `import indexHtml from '../public/index.html'` and `import llmsTxt from '../public/llms.txt'`
 [[rules]]
 type = "Text"
-globs = ["**/*.html"]
+globs = ["**/*.html", "**/*.txt"]
 fallthrough = true
 
 [vars]

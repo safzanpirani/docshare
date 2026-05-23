@@ -12,6 +12,45 @@ short URL → auto-deletes in 24h. Built for handing files to coding agents.
 Deployed at **docs.safzan.dev** — independent of seeshare (`share.safzan.dev`):
 separate Worker, separate R2 bucket, separate bindings.
 
+## Use it (no install required)
+
+Upload any file ≤ 100 MB in one curl — response body is the download URL:
+
+```sh
+curl -T myfile.pdf https://docs.safzan.dev/upload/myfile.pdf
+```
+
+For files up to 300 MB, use the 3-step presigned flow (`/api/doc/presign` →
+PUT to R2 → `/api/doc/finalize`) — the skill below does this for you.
+
+LLMs/agents can read the API spec at <https://docs.safzan.dev/llms.txt>
+([llmstxt.org](https://llmstxt.org/) format).
+
+## Install as an agent skill
+
+Via [`vercel-labs/skills`](https://github.com/vercel-labs/skills) — works for
+Claude Code, opencode, and the other agents the package supports:
+
+```sh
+npx skills add https://github.com/safzanpirani/docshare
+```
+
+That drops `skills/docshare/` into your agent's skills directory
+(`~/.claude/skills/docshare/` for Claude Code,
+`~/.config/opencode/skills/docshare/` for opencode). The agent can then call
+`python3 ~/.claude/skills/docshare/upload.py <file>` to upload anything up to
+300 MB and get back a download URL.
+
+To point the skill at a self-hosted deployment:
+
+```sh
+export DOCSHARE_ENDPOINT=https://your.docshare.example
+```
+
+---
+
+## Self-hosting
+
 ## Architecture
 
 - **Runtime:** single Cloudflare Worker (Hono)

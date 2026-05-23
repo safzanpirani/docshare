@@ -1,0 +1,70 @@
+# docshare
+
+> Temporary file & image hosting for handing artifacts to LLMs/agents. Files
+> auto-delete after 24 hours. Public endpoint: https://docs.safzan.dev
+
+docshare is an open Cloudflare Worker that gives any agent a short-lived
+download URL for any file (≤300 MB) or any image (auto-converted to WebP, with
+optional OCR via Gemini). Built for sharing build artifacts, screenshots, logs,
+and documents with coding agents.
+
+Source: https://github.com/safzanpirani/docshare
+
+## Quickstart (one curl, ≤100 MB)
+
+```bash
+curl -T myfile.pdf https://docs.safzan.dev/upload/myfile.pdf
+```
+
+Response body is the download URL on stdout. Hand that URL to any tool — it
+streams the original file with the original filename.
+
+For files >100 MB, use the 3-step presigned flow (the Worker request body is
+capped at 100 MB on Cloudflare Free/Pro; direct-to-R2 presigned PUT bypasses
+that limit up to 300 MB).
+
+## Agent skill
+
+Install via [`vercel-labs/skills`](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add https://github.com/safzanpirani/docshare
+```
+
+The agent then has a `docshare` skill that takes a local file path and returns
+the share URL. Works with Claude Code, opencode, and the other agents the
+`skills` package supports.
+
+## API
+
+- [PUT /upload/:filename](https://docs.safzan.dev/upload/) — simple one-shot
+  upload, ≤100 MB. Body: raw file bytes. Response: plain-text download URL.
+- [POST /api/upload](https://docs.safzan.dev/api/upload) — image upload, body
+  must be `image/webp` bytes (≤15 MB). Returns JSON `{id, url, uploadedAt,
+  expiresAt, size}`.
+- [POST /api/doc/presign](https://docs.safzan.dev/api/doc/presign) — step 1 of
+  3 for large docs. Body: `{filename, size, contentType}`. Returns `{id,
+  putUrl, downloadUrl, uploadedAt, expiresAt, size}`. PUT the file bytes
+  directly to `putUrl` (a presigned R2 S3 URL), then POST to /api/doc/finalize.
+- [POST /api/doc/finalize](https://docs.safzan.dev/api/doc/finalize) — step 3.
+  Body: `{id}`. Confirms the upload landed and enforces max size.
+- [GET /d/:id/:filename](https://docs.safzan.dev/d/) — download a doc. Always
+  served `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`.
+- [GET /i/:id.webp](https://docs.safzan.dev/i/) — fetch an image.
+- [POST /api/ocr/:id](https://docs.safzan.dev/api/ocr/) — run OCR on an image
+  (Gemini). Result cached server-side; second call on same image is free.
+- [GET /api/info/:id](https://docs.safzan.dev/api/info/) — metadata for either
+  an image or a doc.
+
+## Limits
+
+- 300 MB max per doc; 15 MB max per image
+- 5 docs / 1.5 GB per IP per day (sustained); 2 doc uploads per 60 s (burst)
+- 6 image uploads per 60 s, 3 OCR calls per 60 s
+- All uploads auto-deleted after 24 h via R2 lifecycle rule
+
+## What this is deliberately not
+
+- Authenticated or account-based — anyone on the internet can upload
+- Long-term storage (24 h TTL is hard)
+- A general CDN — designed for short-lived agent handoffs

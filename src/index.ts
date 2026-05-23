@@ -2,10 +2,16 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { cors } from 'hono/cors'
 import indexHtml from '../public/index.html'
+import llmsTxt from '../public/llms.txt'
 import { generateId, isValidId } from './id'
 import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
 import { checkAndChargeDaily } from './ratelimit'
+
+// Hard ceiling on the simple PUT /upload/:filename route. CF Workers cap the
+// request body at 100MB on Free/Pro. For files larger than this, clients must
+// use the 3-step presigned flow (/api/doc/presign → PUT to R2 → /finalize).
+const SIMPLE_UPLOAD_MAX = 100 * 1024 * 1024
 
 type RateLimiter = {
   limit: (opts: { key: string }) => Promise<{ success: boolean }>
@@ -39,6 +45,68 @@ app.use('/api/*', cors())
 app.get('/', (c) => {
   c.header('cache-control', 'public, max-age=300')
   return c.html(indexHtml)
+})
+
+// llms.txt — see https://llmstxt.org/ — gives LLMs/agents a curated overview
+// of the API so they can use docshare correctly without scraping the UI.
+app.get('/llms.txt', (c) => {
+  c.header('content-type', 'text/plain; charset=utf-8')
+  c.header('cache-control', 'public, max-age=3600')
+  return c.body(llmsTxt)
+})
+
+// One-shot upload for files <= 100MB. Body is the raw file bytes; the response
+// body is the download URL as plain text — designed to be the dumbest possible
+// curl call:
+//   curl -T myfile.pdf https://docs.safzan.dev/upload/myfile.pdf
+// For files >100MB use the /api/doc/presign → PUT → /api/doc/finalize flow
+// (the Worker request body is hard-capped at 100MB on Free/Pro plans).
+app.put('/upload/:filename', async (c) => {
+  const ip = clientIp(c.req.raw)
+  const burst = await c.env.DOC_LIMITER.limit({ key: ip })
+  if (!burst.success) return c.text('rate_limited\n', 429)
+
+  const filenameRaw = c.req.param('filename') ?? 'file'
+  let filename: string
+  try { filename = sanitizeFilename(decodeURIComponent(filenameRaw)) }
+  catch { filename = sanitizeFilename(filenameRaw) }
+  const contentType = c.req.header('content-type') || 'application/octet-stream'
+
+  const declared = Number(c.req.header('content-length') ?? '0')
+  if (!Number.isFinite(declared) || declared <= 0) {
+    return c.text('content-length header required\n', 411)
+  }
+  if (declared > SIMPLE_UPLOAD_MAX) {
+    return c.text(`too_large: simple upload route caps at ${SIMPLE_UPLOAD_MAX} bytes. Use POST /api/doc/presign for files up to ${c.env.MAX_DOC_BYTES} bytes.\n`, 413)
+  }
+
+  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
+  const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 1572864000
+  const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, dailyCount, dailyBytes)
+  if (!quota.ok) return c.text(`${quota.reason} (limit ${quota.limit})\n`, 429)
+
+  const buf = await c.req.arrayBuffer()
+  if (buf.byteLength === 0) return c.text('empty\n', 400)
+  if (buf.byteLength > SIMPLE_UPLOAD_MAX) return c.text('too_large\n', 413)
+
+  let id = generateId(16)
+  if (await c.env.BUCKET.head(`doc/${id}`)) id = generateId(16)
+
+  const uploadedAt = Date.now()
+  const ttlHours = Number(c.env.TTL_HOURS) || 24
+  const expiresAt = uploadedAt + ttlHours * 3600 * 1000
+
+  await c.env.BUCKET.put(`doc/${id}`, buf, {
+    httpMetadata: { contentType },
+  })
+  const meta = { filename, contentType, size: buf.byteLength, uploadedAt, expiresAt, finalized: true }
+  await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
+    httpMetadata: { contentType: 'application/json' },
+  })
+
+  const url = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
+  c.header('content-type', 'text/plain; charset=utf-8')
+  return c.body(url + '\n')
 })
 
 // ----------------------------------------------------------------------------
