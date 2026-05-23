@@ -25,13 +25,26 @@ everything after 24 hours.
 
 ## How to invoke
 
-The script lives next to this SKILL.md, named `upload.sh`. Pure bash + curl,
-no other deps. Run it with the file path; it prints the download URL on
-stdout and exits 0, or prints an error to stderr and exits non-zero.
+Two equivalent scripts live next to this SKILL.md. **Pick the one for the OS
+you're running on** — they take the same arg and produce the same output
+(download URL on stdout, error on stderr, non-zero exit on failure):
+
+- **macOS / Linux / WSL / git-bash:** `upload.sh` — pure bash + curl
+- **Windows (native PowerShell):** `upload.ps1` — pure PowerShell, no curl
 
 ```bash
+# macOS / Linux / WSL / git-bash
 ~/.claude/skills/docshare/upload.sh /path/to/file
 ```
+
+```powershell
+# Windows PowerShell (5.1 ships with Windows; or pwsh 7+)
+powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.ps1" "C:\path\to\file"
+```
+
+Detection rule of thumb: if you're in a Windows shell where `bash` isn't
+available, use `upload.ps1`; otherwise `upload.sh`. Both stream the file
+without loading it into memory (works fine up to the 300 MB max).
 
 ## Reporting the result
 
@@ -44,7 +57,14 @@ for a link. Mention the 24 h TTL only if the user seems unaware of it.
 If the user has their own docshare worker, set `DOCSHARE_ENDPOINT`:
 
 ```bash
+# macOS / Linux
 DOCSHARE_ENDPOINT=https://your.example ~/.claude/skills/docshare/upload.sh /path/to/file
+```
+
+```powershell
+# Windows PowerShell
+$env:DOCSHARE_ENDPOINT = 'https://your.example'
+powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.ps1" "C:\path\to\file"
 ```
 
 ## What the script does under the hood
