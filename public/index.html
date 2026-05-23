@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>docshare · share files & images with coding agents</title>
-<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤100MB) gets a short download URL. Auto-deletes in 24h." />
+<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤300MB) gets a short download URL. Auto-deletes in 24h." />
 <meta name="color-scheme" content="dark" />
 <style>
   :root {
@@ -177,7 +177,7 @@
     <div class="drop-title">
       <span class="kbd">⌘V</span> / <span class="kbd">Ctrl+V</span> to paste · drag &amp; drop · or click to browse
     </div>
-    <div class="drop-sub">images → WebP · any file ≤ 100 MB · 24h TTL · sent straight to storage</div>
+    <div class="drop-sub">images → WebP · any file ≤ 300 MB · 24h TTL · sent straight to storage</div>
     <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
     <div id="drop-status" class="drop-status"></div>
   </div>
@@ -211,7 +211,7 @@
 <script>
 (() => {
   const MAX_IMAGE_BYTES = 15 * 1024 * 1024
-  const MAX_DOC_BYTES = 100 * 1024 * 1024
+  const MAX_DOC_BYTES = 300 * 1024 * 1024
   const MAX_DIMENSION = 4096
   const RECENT_KEY = 'docshare.recent'
   const MAX_RECENT = 20
@@ -544,7 +544,7 @@
     })
   }
   async function uploadDoc(file) {
-    if (file.size > MAX_DOC_BYTES) throw new Error('file too large (100 MB max)')
+    if (file.size > MAX_DOC_BYTES) throw new Error('file too large (300 MB max)')
     setStatus('preparing upload…')
     const presignRes = await fetch('/api/doc/presign', {
       method: 'POST',
@@ -557,7 +557,7 @@
       if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
       if (err === 'daily_count') throw new Error('daily upload limit reached')
       if (err === 'daily_bytes') throw new Error('daily size limit reached')
-      if (err === 'too_large') throw new Error('file too large (100 MB max)')
+      if (err === 'too_large') throw new Error('file too large (300 MB max)')
       throw new Error(err)
     }
 

@@ -53,9 +53,9 @@ PUBLIC_ORIGIN = "https://docs.safzan.dev"
 TTL_HOURS = "24"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 MAX_UPLOAD_BYTES = "15728640"      # 15 MB, images (webp)
-MAX_DOC_BYTES = "104857600"        # 100 MB, docs
+MAX_DOC_BYTES = "314572800"        # 300 MB, docs
 DOC_DAILY_COUNT = "5"              # docs per IP per day
-DOC_DAILY_BYTES = "314572800"      # 300 MB per IP per day
+DOC_DAILY_BYTES = "1572864000"     # 1.5 GB per IP per day
 R2_BUCKET_NAME = "docshare"        # used by the S3 presigner
 R2_ACCOUNT_ID = "467d682e615fa1070ddac20ca0b9e21b"
 

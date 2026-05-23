@@ -5,7 +5,7 @@ short URL → auto-deletes in 24h. Built for handing files to coding agents.
 
 - **Images** are converted to WebP in the browser and posted through the Worker
   (small payloads), with optional Gemini OCR — exactly like `seeshare`.
-- **Any other file** (≤ 100 MB) is uploaded **straight to R2 via a presigned PUT
+- **Any other file** (≤ 300 MB) is uploaded **straight to R2 via a presigned PUT
   URL** (the bytes never pass through the Worker) and served back as a forced
   download, so an LLM/agent can `curl` it.
 
@@ -20,7 +20,7 @@ separate Worker, separate R2 bucket, separate bindings.
   - `doc/{id}` — uploaded files (16-char id), `meta/{id}.json` — filename/type/size
 - **TTL:** R2 lifecycle rule deletes objects > 1 day old (see setup)
 - **Large uploads:** presigned S3 PUT direct to R2, bypassing the Worker's
-  ~100 MB request-body limit. Requires an R2 S3-API token.
+  ~300 MB request-body limit. Requires an R2 S3-API token.
 - **Abuse control:**
   - burst: Cloudflare rate-limit bindings (images 6/60s, docs 2/60s, OCR 3/60s)
   - sustained: KV per-IP daily caps (default 5 docs/day, 300 MB/day) — `src/ratelimit.ts`
@@ -110,9 +110,9 @@ bucket + token + CORS must exist for doc uploads to work locally.
 |---|---|---|
 | `TTL_HOURS` | `24` | "expires at" shown to clients. **Actual delete is the R2 lifecycle rule** — keep in sync. |
 | `MAX_UPLOAD_BYTES` | 15 MB | image (webp) cap |
-| `MAX_DOC_BYTES` | 100 MB | doc cap |
+| `MAX_DOC_BYTES` | 300 MB | doc cap |
 | `DOC_DAILY_COUNT` | `5` | docs per IP per day |
-| `DOC_DAILY_BYTES` | 300 MB | doc bytes per IP per day |
+| `DOC_DAILY_BYTES` | 1.5 GB | doc bytes per IP per day |
 
 ## Known limitations
 
