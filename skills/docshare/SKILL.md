@@ -25,19 +25,12 @@ everything after 24 hours.
 
 ## How to invoke
 
-The script lives next to this SKILL.md, named `upload.py`. It needs only
-Python 3 (no external packages). Run it with the file path; it prints the
-download URL on stdout and exits 0, or prints an error to stderr and exits
-non-zero.
+The script lives next to this SKILL.md, named `upload.sh`. Pure bash + curl,
+no other deps. Run it with the file path; it prints the download URL on
+stdout and exits 0, or prints an error to stderr and exits non-zero.
 
 ```bash
-python3 "$(dirname "$0")/upload.py" /path/to/file
-```
-
-In practice, when this skill is installed at `~/.claude/skills/docshare/`:
-
-```bash
-python3 ~/.claude/skills/docshare/upload.py /path/to/file
+~/.claude/skills/docshare/upload.sh /path/to/file
 ```
 
 ## Reporting the result
@@ -51,7 +44,7 @@ for a link. Mention the 24 h TTL only if the user seems unaware of it.
 If the user has their own docshare worker, set `DOCSHARE_ENDPOINT`:
 
 ```bash
-DOCSHARE_ENDPOINT=https://your.example python3 ~/.claude/skills/docshare/upload.py /path/to/file
+DOCSHARE_ENDPOINT=https://your.example ~/.claude/skills/docshare/upload.sh /path/to/file
 ```
 
 ## What the script does under the hood

@@ -38,7 +38,7 @@ npx skills add https://github.com/safzanpirani/docshare
 That drops `skills/docshare/` into your agent's skills directory
 (`~/.claude/skills/docshare/` for Claude Code,
 `~/.config/opencode/skills/docshare/` for opencode). The agent can then call
-`python3 ~/.claude/skills/docshare/upload.py <file>` to upload anything up to
+`~/.claude/skills/docshare/upload.sh <file>` to upload anything up to
 300 MB and get back a download URL.
 
 To point the skill at a self-hosted deployment:
