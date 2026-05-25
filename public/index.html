@@ -3,9 +3,32 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>docshare · share files & images with coding agents</title>
-<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤300MB) gets a short download URL. Auto-deletes in 24h." />
+<title>docshare · share files, images & video with coding agents</title>
+<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤300MB) gets a short download URL with inline preview for video/audio. Auto-deletes in 24h." />
 <meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#a78bfa" />
+
+<!-- Open Graph / Twitter card — controls the preview Discord/Telegram/Slack
+     render when this URL is pasted into a chat. -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="docshare" />
+<meta property="og:title" content="docshare · share files, images & video with coding agents" />
+<meta property="og:description" content="Paste, drop, or pick anything (≤300 MB). Inline previews for video & audio. Short URL, auto-deletes in 24h." />
+<meta property="og:url" content="https://docs.safzan.dev/" />
+<meta property="og:image" content="https://docs.safzan.dev/og.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:type" content="image/png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="docshare" />
+<meta name="twitter:description" content="Share files, images & video with coding agents. 24h auto-delete." />
+<meta name="twitter:image" content="https://docs.safzan.dev/og.png" />
+
+<!-- Themed video/audio player for uploaded media. ~30 KB gzipped, only the
+     custom elements; native <video>/<audio> still do the heavy lifting.
+     Pinned to an exact version so a published media-chrome update can't change
+     what executes on docs.safzan.dev without a deploy. -->
+<script type="module" src="https://esm.sh/media-chrome@4.19.0"></script>
 <style>
   :root {
     --bg: #0b0a10;
@@ -95,11 +118,31 @@
     background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
     transition: border-color .15s, background .15s;
   }
+  .item.media { display: flex; flex-direction: column; gap: 12px; }
   .item:hover { border-color: var(--border-strong); background: var(--bg-card-hover); }
   .thumb {
     width: 110px; height: 110px; border-radius: 6px; overflow: hidden; background: #000;
     display: grid; place-items: center; grid-column: 2; grid-row: 1;
   }
+  /* media-chrome inline player — themed to match the purple palette. */
+  .media-preview { width: 100%; border-radius: 6px; overflow: hidden; background: #000; }
+  .media-preview.video { aspect-ratio: 16 / 9; }
+  .media-preview media-controller {
+    width: 100%; height: 100%; display: block;
+    --media-primary-color: var(--accent);
+    --media-secondary-color: rgba(167,139,250,0.18);
+    --media-text-color: var(--text);
+    --media-background-color: #000;
+    --media-control-bar-display: flex;
+    --media-control-background: rgba(11,10,16,0.78);
+    --media-control-hover-background: rgba(167,139,250,0.22);
+    --media-range-bar-color: var(--accent);
+    --media-range-track-background: rgba(255,255,255,0.18);
+  }
+  .media-preview video,
+  .media-preview audio { width: 100%; height: 100%; display: block; background: #000; }
+  .media-preview.audio { aspect-ratio: auto; height: 44px; background: transparent; }
+  .media-preview.audio media-controller { height: 44px; }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .thumb.doc { background: #1b1827; color: var(--text-dim); }
   .thumb.doc .ext {
@@ -320,22 +363,31 @@
 
   function itemEl(item) {
     const isDoc = item.kind === 'doc'
+    const ct = (isDoc && item.contentType) || ''
+    const isVideo = isDoc && ct.startsWith('video/')
+    const isAudio = isDoc && ct.startsWith('audio/')
+    const isMedia = isVideo || isAudio
+
     const el = document.createElement('div')
-    el.className = 'item'
+    el.className = 'item' + (isMedia ? ' media' : '')
     el.dataset.id = item.id
 
-    // thumb
-    const thumb = document.createElement('div')
-    if (isDoc) {
+    if (isMedia) {
+      // Full-width inline player for video/audio uploads.
+      el.appendChild(mediaPlayerEl(item, isVideo ? 'video' : 'audio'))
+    } else if (isDoc) {
+      const thumb = document.createElement('div')
       thumb.className = 'thumb doc'
       thumb.innerHTML = svgFile() + `<div class="ext">${extOf(item.filename)}</div>`
+      el.appendChild(thumb)
     } else {
+      const thumb = document.createElement('div')
       thumb.className = 'thumb'
       const img = document.createElement('img')
       img.src = item.url; img.alt = ''; img.loading = 'lazy'
       thumb.appendChild(img)
+      el.appendChild(thumb)
     }
-    el.appendChild(thumb)
 
     const body = document.createElement('div')
     body.className = 'item-body'
@@ -369,8 +421,9 @@
     promptBtn.className = 'btn primary'
     promptBtn.innerHTML = `${svgCopy()} Prompt`
     promptBtn.addEventListener('click', () => {
-      const line = isDoc
-        ? `Download and read this file: ${item.url}`
+      const line = isVideo ? `Watch this video: ${item.url}`
+        : isAudio ? `Listen to this audio: ${item.url}`
+        : isDoc ? `Download and read this file: ${item.url}`
         : `Look at this image: ${item.url}`
       copy(line, 'prompt copied')
     })
@@ -413,6 +466,30 @@
     return el
   }
 
+  function mediaPlayerEl(item, kind) {
+    const wrap = document.createElement('div')
+    wrap.className = `media-preview ${kind}`
+    const mediaTag = kind === 'video'
+      ? `<video slot="media" src="${escapeAttr(item.url)}" preload="metadata" playsinline crossorigin="anonymous"></video>`
+      : `<audio slot="media" src="${escapeAttr(item.url)}" preload="metadata" crossorigin="anonymous"></audio>`
+    wrap.innerHTML = `
+      <media-controller${kind === 'audio' ? ' audio' : ''}>
+        ${mediaTag}
+        <media-control-bar>
+          <media-play-button></media-play-button>
+          <media-mute-button></media-mute-button>
+          <media-volume-range></media-volume-range>
+          <media-time-display showduration></media-time-display>
+          <media-time-range></media-time-range>
+          ${kind === 'video' ? '<media-pip-button></media-pip-button><media-fullscreen-button></media-fullscreen-button>' : ''}
+        </media-control-bar>
+      </media-controller>
+    `
+    return wrap
+  }
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
   function svgCopy() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' }
   function svgScan() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>' }
   function svgDownload() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' }
@@ -583,7 +660,7 @@
       })
     } catch {}
 
-    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: file.size })
+    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, contentType: file.type || 'application/octet-stream', uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: file.size })
     copy(presign.downloadUrl, 'uploaded · URL copied')
     setStatus('')
   }

@@ -3,6 +3,8 @@ import type { Context } from 'hono'
 import { cors } from 'hono/cors'
 import indexHtml from '../public/index.html'
 import llmsTxt from '../public/llms.txt'
+import ogPng from '../public/og.png'
+import ogSvg from '../public/og.svg'
 import { generateId, isValidId } from './id'
 import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
@@ -12,6 +14,29 @@ import { checkAndChargeDaily } from './ratelimit'
 // request body at 100MB on Free/Pro. For files larger than this, clients must
 // use the 3-step presigned flow (/api/doc/presign → PUT to R2 → /finalize).
 const SIMPLE_UPLOAD_MAX = 100 * 1024 * 1024
+const DEFAULT_DOC_CONTENT_TYPE = 'application/octet-stream'
+const SAFE_INLINE_CONTENT_TYPES = new Set([
+  'image/avif',
+  'image/bmp',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'audio/aac',
+  'audio/flac',
+  'audio/mp3',
+  'audio/mp4',
+  'audio/mpeg',
+  'audio/ogg',
+  'audio/wav',
+  'audio/webm',
+  'audio/x-wav',
+  'video/mp4',
+  'video/ogg',
+  'video/quicktime',
+  'video/webm',
+  'video/x-m4v',
+])
 
 type RateLimiter = {
   limit: (opts: { key: string }) => Promise<{ success: boolean }>
@@ -53,6 +78,23 @@ app.get('/llms.txt', (c) => {
   c.header('content-type', 'text/plain; charset=utf-8')
   c.header('cache-control', 'public, max-age=3600')
   return c.body(llmsTxt)
+})
+
+// Open Graph card image — Discord/Telegram/Slack fetch and cache this when
+// docs.safzan.dev is pasted into a chat.
+app.get('/og.svg', (c) => {
+  c.header('content-type', 'image/svg+xml; charset=utf-8')
+  c.header('cache-control', 'public, max-age=86400, immutable')
+  return c.body(ogSvg)
+})
+
+app.get('/og.png', (c) => {
+  return new Response(ogPng, {
+    headers: {
+      'content-type': 'image/png',
+      'cache-control': 'public, max-age=86400, immutable',
+    },
+  })
 })
 
 // One-shot upload for files <= 100MB. Body is the raw file bytes; the response
@@ -287,8 +329,13 @@ app.post('/api/doc/finalize', async (c) => {
   return c.json({ id, size: obj.size, finalized: true })
 })
 
-// Download — forced attachment, never inline. The :filename segment is
-// cosmetic (so curl/agents save a sensible name); the id is the real key.
+// Download / inline-serve. The :filename segment is cosmetic (so curl/agents
+// save a sensible name); the id is the real key.
+//
+// Serving everything as `attachment` blocks stored-XSS via .html/.svg uploads,
+// but it also stops Discord/Telegram from auto-playing video embeds and stops
+// the browser from previewing images. Compromise: known-safe browser media
+// types get `inline`; everything else stays `attachment` + nosniff.
 app.get('/d/:id/:filename', serveDoc)
 app.get('/d/:id', serveDoc)
 
@@ -296,27 +343,104 @@ async function serveDoc(c: Context<{ Bindings: Bindings }>) {
   const id = c.req.param('id') ?? ''
   if (!isValidId(id)) return c.json({ error: 'bad_id' }, 400)
 
-  const obj = await c.env.BUCKET.get(`doc/${id}`)
-  if (!obj) return c.notFound()
-
   let filename = id
-  let contentType = 'application/octet-stream'
+  let contentType = DEFAULT_DOC_CONTENT_TYPE
   const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
   if (metaObj) {
     const meta = await metaObj.json<{ filename?: string; contentType?: string }>()
     if (meta.filename) filename = sanitizeFilename(meta.filename)
-    if (meta.contentType) contentType = meta.contentType
+    if (meta.contentType) contentType = normalizeContentType(meta.contentType)
   }
 
+  const inline = shouldServeInline(contentType)
+
+  // Parse a single-range `Range: bytes=start-end` header so HTML5 <video> can
+  // seek without re-downloading. Suffix ranges are supported because some
+  // media clients probe tail metadata. Multi-range and malformed forms fall
+  // through to a full-body response.
+  const rangeHeader = c.req.header('range')
+  let rangeOpts: R2GetOptions['range'] | undefined
+  if (inline && rangeHeader) {
+    rangeOpts = parseSingleRange(rangeHeader)
+  }
+
+  const obj = rangeOpts
+    ? await c.env.BUCKET.get(`doc/${id}`, { range: rangeOpts })
+    : await c.env.BUCKET.get(`doc/${id}`)
+  if (!obj) return c.notFound()
+
   const headers = new Headers()
-  // Force download. Serving arbitrary user files inline on our origin would be
-  // a stored-XSS vector (malicious .html/.svg). attachment + nosniff blocks it.
   headers.set('content-type', contentType)
-  headers.set('content-disposition', `attachment; filename="${asciiFilename(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`)
+  const disposition = inline ? 'inline' : 'attachment'
+  headers.set('content-disposition', `${disposition}; filename="${asciiFilename(filename)}"; filename*=UTF-8''${rfc5987Value(filename)}`)
   headers.set('x-content-type-options', 'nosniff')
   headers.set('cache-control', 'public, max-age=300, immutable')
+  if (inline) headers.set('accept-ranges', 'bytes')
   if (obj.httpEtag) headers.set('etag', obj.httpEtag)
+
+  // 206 Partial Content when a Range was honoured.
+  if (rangeOpts && obj.range) {
+    const total = obj.size
+    const { start, length } = returnedRangeBounds(obj.range, total)
+    if (length <= 0 || start >= total) {
+      headers.set('content-range', `bytes */${total}`)
+      headers.delete('content-length')
+      return new Response(null, { status: 416, headers })
+    }
+    headers.set('content-range', `bytes ${start}-${start + length - 1}/${total}`)
+    headers.set('content-length', String(length))
+    return new Response(obj.body, { status: 206, headers })
+  }
+
+  headers.set('content-length', String(obj.size))
   return new Response(obj.body, { headers })
+}
+
+// Allow only known browser media types to render inline. Broad image/* is too
+// permissive for this origin because SVG and future active media types would
+// otherwise be controlled by client-declared metadata.
+function shouldServeInline(contentType: string): boolean {
+  return SAFE_INLINE_CONTENT_TYPES.has(normalizeContentType(contentType))
+}
+
+function normalizeContentType(contentType: string): string {
+  const ct = String(contentType).toLowerCase().split(';')[0].trim()
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(ct)
+    ? ct
+    : DEFAULT_DOC_CONTENT_TYPE
+}
+
+function parseSingleRange(rangeHeader: string): R2GetOptions['range'] | undefined {
+  const range = rangeHeader.trim()
+  let m = /^bytes=(\d+)-(\d*)$/.exec(range)
+  if (m) {
+    const offset = Number(m[1])
+    if (!Number.isSafeInteger(offset)) return undefined
+    const endStr = m[2]
+    if (!endStr) return { offset }
+    const end = Number(endStr)
+    if (!Number.isSafeInteger(end) || end < offset) return undefined
+    return { offset, length: end - offset + 1 }
+  }
+
+  m = /^bytes=-(\d+)$/.exec(range)
+  if (m) {
+    const suffix = Number(m[1])
+    if (Number.isSafeInteger(suffix) && suffix > 0) return { suffix }
+  }
+  return undefined
+}
+
+function returnedRangeBounds(range: R2Range, total: number): { start: number; length: number } {
+  if ('offset' in range) {
+    const start = range.offset ?? 0
+    return { start, length: range.length ?? total - start }
+  }
+  if ('suffix' in range) {
+    const length = Math.min(range.suffix, total)
+    return { start: total - length, length }
+  }
+  return { start: 0, length: Math.min(range.length, total) }
 }
 
 // Metadata for either an image (id) or a doc (id).
@@ -376,6 +500,12 @@ function sanitizeFilename(name: string): string {
 // UTF-8 version in `filename*`).
 function asciiFilename(name: string): string {
   return name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '')
+}
+
+function rfc5987Value(name: string): string {
+  return encodeURIComponent(name).replace(/['()*]/g, (c) =>
+    `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  )
 }
 
 export default app

@@ -42,10 +42,15 @@ type = "ratelimit"
 namespace_id = "2003"
 simple = { limit = 3, period = 60 }
 
-# Allow `import indexHtml from '../public/index.html'` and `import llmsTxt from '../public/llms.txt'`
+# Allow text and binary public assets to be imported by the Worker.
 [[rules]]
 type = "Text"
-globs = ["**/*.html", "**/*.txt"]
+globs = ["**/*.html", "**/*.txt", "**/*.svg"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
 fallthrough = true
 
 [vars]
