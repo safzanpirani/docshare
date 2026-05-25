@@ -424,8 +424,14 @@
     const actions = document.createElement('div')
     actions.className = 'actions'
 
+    const linkBtn = document.createElement('button')
+    linkBtn.className = 'btn primary'
+    linkBtn.innerHTML = `${svgCopy()} Copy link`
+    linkBtn.addEventListener('click', () => copy(item.url, 'URL copied'))
+    actions.appendChild(linkBtn)
+
     const promptBtn = document.createElement('button')
-    promptBtn.className = 'btn primary'
+    promptBtn.className = 'btn'
     promptBtn.innerHTML = `${svgCopy()} Prompt`
     promptBtn.addEventListener('click', () => {
       const line = isVideo ? `Watch this video: ${item.url}`
