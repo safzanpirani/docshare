@@ -361,11 +361,18 @@
     for (const item of items) recent.appendChild(itemEl(item))
   }
 
+  const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv', 'mkv'])
+  const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'wav', 'flac', 'oga', 'ogg', 'opus'])
+
   function itemEl(item) {
     const isDoc = item.kind === 'doc'
     const ct = (isDoc && item.contentType) || ''
-    const isVideo = isDoc && ct.startsWith('video/')
-    const isAudio = isDoc && ct.startsWith('audio/')
+    const ext = extOf(item.filename || '').toLowerCase()
+    // contentType may be missing on older localStorage entries or when the
+    // browser didn't infer a MIME from the drop (CleanShot, screen-recorders).
+    // Filename extension is the reliable fallback.
+    const isVideo = isDoc && (ct.startsWith('video/') || VIDEO_EXTS.has(ext))
+    const isAudio = isDoc && (ct.startsWith('audio/') || AUDIO_EXTS.has(ext))
     const isMedia = isVideo || isAudio
 
     const el = document.createElement('div')
