@@ -10,9 +10,44 @@ type DailyQuota = { count: number; bytes: number }
 
 const DAY_TTL_SECONDS = 60 * 60 * 48 // keep a day's counter ~2 days, then expire
 
-function quotaKey(ip: string): string {
-  const day = new Date().toISOString().slice(0, 10) // UTC YYYY-MM-DD
+function utcDay(d = new Date()): string {
+  return d.toISOString().slice(0, 10) // UTC YYYY-MM-DD
+}
+
+function quotaKey(ip: string, day = utcDay()): string {
   return `quota:${day}:${ip}`
+}
+
+// Stable, non-reversible-ish tag for the uploader's IP. Stored in metadata so a
+// later delete can verify "same person who uploaded" before refunding quota,
+// without persisting the raw IP. (SHA-256 of an IP isn't strong anonymisation —
+// the input space is small — but the tag is never returned to clients.)
+export async function hashIp(ip: string): Promise<string> {
+  const data = new TextEncoder().encode(`docshare:${ip}`)
+  const digest = await crypto.subtle.digest('SHA-256', data)
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// Give back one upload's worth of daily quota when the uploader deletes a file
+// they uploaded *today*. Refusing cross-day / cross-IP refunds stops someone
+// farming quota by deleting old or other people's files. Best-effort.
+export async function refundDaily(
+  kv: KVNamespace,
+  ip: string,
+  size: number,
+  uploadedAt: number,
+  uploaderTag: string | undefined,
+): Promise<void> {
+  if (!Number.isFinite(uploadedAt) || uploadedAt <= 0) return
+  if (utcDay(new Date(uploadedAt)) !== utcDay()) return // only today's counter is live
+  if (!uploaderTag || (await hashIp(ip)) !== uploaderTag) return // only the original uploader
+
+  const cur = await readQuota(kv, ip)
+  const next: DailyQuota = {
+    count: Math.max(0, cur.count - 1),
+    bytes: Math.max(0, cur.bytes - Math.max(0, size)),
+  }
+  await kv.put(quotaKey(ip), JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
 }
 
 async function readQuota(kv: KVNamespace, ip: string): Promise<DailyQuota> {

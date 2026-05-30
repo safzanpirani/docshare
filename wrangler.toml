@@ -53,6 +53,11 @@ type = "Data"
 globs = ["**/*.png"]
 fallthrough = true
 
+# Re-sum the bucket every 30 min and overwrite the storage counter, so objects
+# the 24h lifecycle rule deletes get subtracted (see src/storage.ts).
+[triggers]
+crons = ["*/30 * * * *"]
+
 [vars]
 PUBLIC_ORIGIN = "https://docs.safzan.dev"
 TTL_HOURS = "24"
@@ -61,6 +66,7 @@ MAX_UPLOAD_BYTES = "15728640"      # 15 MB, images (webp)
 MAX_DOC_BYTES = "314572800"        # 300 MB, docs
 DOC_DAILY_COUNT = "5"              # docs per IP per day
 DOC_DAILY_BYTES = "1572864000"     # 1.5 GB per IP per day
+MAX_TOTAL_BYTES = "9000000000"     # 9 GB global hard cap (R2 free tier is 10 GB)
 R2_BUCKET_NAME = "docshare"        # used by the S3 presigner
 R2_ACCOUNT_ID = "467d682e615fa1070ddac20ca0b9e21b"
 

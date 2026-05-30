@@ -8,7 +8,8 @@ import ogSvg from '../public/og.svg'
 import { generateId, isValidId } from './id'
 import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
-import { checkAndChargeDaily } from './ratelimit'
+import { checkAndChargeDaily, hashIp, refundDaily } from './ratelimit'
+import { addStorageUsed, reconcileStorage, withinStorageCap } from './storage'
 
 // Hard ceiling on the simple PUT /upload/:filename route. CF Workers cap the
 // request body at 100MB on Free/Pro. For files larger than this, clients must
@@ -56,6 +57,7 @@ type Bindings = {
   MAX_DOC_BYTES: string
   DOC_DAILY_COUNT: string
   DOC_DAILY_BYTES: string
+  MAX_TOTAL_BYTES: string
   // R2 S3-API credentials for presigning (set as secrets)
   R2_ACCOUNT_ID: string
   R2_BUCKET_NAME: string
@@ -122,6 +124,10 @@ app.put('/upload/:filename', async (c) => {
     return c.text(`too_large: simple upload route caps at ${SIMPLE_UPLOAD_MAX} bytes. Use POST /api/doc/presign for files up to ${c.env.MAX_DOC_BYTES} bytes.\n`, 413)
   }
 
+  if (!(await withinStorageCap(c.env.QUOTA, declared, capBytes(c.env)))) {
+    return c.text('storage_full: service storage cap reached, try again later\n', 507)
+  }
+
   const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
   const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 1572864000
   const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, dailyCount, dailyBytes)
@@ -141,10 +147,11 @@ app.put('/upload/:filename', async (c) => {
   await c.env.BUCKET.put(`doc/${id}`, buf, {
     httpMetadata: { contentType },
   })
-  const meta = { filename, contentType, size: buf.byteLength, uploadedAt, expiresAt, finalized: true }
+  const meta = { filename, contentType, size: buf.byteLength, uploadedAt, expiresAt, finalized: true, uploaderTag: await hashIp(ip) }
   await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
     httpMetadata: { contentType: 'application/json' },
   })
+  await addStorageUsed(c.env.QUOTA, buf.byteLength)
 
   const url = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
   c.header('content-type', 'text/plain; charset=utf-8')
@@ -173,14 +180,19 @@ app.post('/api/upload', async (c) => {
   if (buf.byteLength > max) return c.json({ error: 'too_large', max }, 413)
   if (!isWebp(buf)) return c.json({ error: 'webp_required' }, 415)
 
+  if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, capBytes(c.env)))) {
+    return c.json({ error: 'storage_full' }, 507)
+  }
+
   let id = generateId(8)
   if (await c.env.BUCKET.head(`img/${id}.webp`)) id = generateId(8)
 
   const uploadedAt = Date.now()
   await c.env.BUCKET.put(`img/${id}.webp`, buf, {
     httpMetadata: { contentType: 'image/webp' },
-    customMetadata: { uploadedAt: uploadedAt.toString() },
+    customMetadata: { uploadedAt: uploadedAt.toString(), uploaderTag: await hashIp(ip) },
   })
+  await addStorageUsed(c.env.QUOTA, buf.byteLength)
 
   const ttlHours = Number(c.env.TTL_HOURS) || 24
   const expiresAt = uploadedAt + ttlHours * 3600 * 1000
@@ -264,6 +276,12 @@ app.post('/api/doc/presign', async (c) => {
   if (!Number.isFinite(size) || size <= 0) return c.json({ error: 'bad_size' }, 400)
   if (size > maxDoc) return c.json({ error: 'too_large', max: maxDoc }, 413)
 
+  // Global storage cap. The bytes are charged to the counter at /finalize with
+  // the real object size; here we only reject if the declared size wouldn't fit.
+  if (!(await withinStorageCap(c.env.QUOTA, size, capBytes(c.env)))) {
+    return c.json({ error: 'storage_full' }, 507)
+  }
+
   const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
   const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 300 * 1024 * 1024
   const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, dailyCount, dailyBytes)
@@ -278,7 +296,7 @@ app.post('/api/doc/presign', async (c) => {
   const ttlHours = Number(c.env.TTL_HOURS) || 24
   const expiresAt = uploadedAt + ttlHours * 3600 * 1000
 
-  const meta = { filename, contentType, size, uploadedAt, expiresAt, finalized: false }
+  const meta = { filename, contentType, size, uploadedAt, expiresAt, finalized: false, uploaderTag: await hashIp(ip) }
   await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
     httpMetadata: { contentType: 'application/json' },
   })
@@ -318,14 +336,19 @@ app.post('/api/doc/finalize', async (c) => {
   }
 
   const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
+  let alreadyFinalized = false
   if (metaObj) {
     const meta = await metaObj.json<Record<string, unknown>>()
+    alreadyFinalized = meta.finalized === true
     meta.size = obj.size
     meta.finalized = true
     await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
       httpMetadata: { contentType: 'application/json' },
     })
   }
+  // Charge the global storage counter with the real object size, exactly once
+  // (finalize is idempotent — a re-finalize must not double-count).
+  if (!alreadyFinalized) await addStorageUsed(c.env.QUOTA, obj.size)
   return c.json({ id, size: obj.size, finalized: true })
 })
 
@@ -465,13 +488,71 @@ app.get('/api/info/:id', async (c) => {
   const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
   if (metaObj) {
     const meta = await metaObj.json<Record<string, unknown>>()
+    // uploaderTag is internal (used to authorise quota refunds) — never expose.
+    delete meta.uploaderTag
     return c.json({ id, kind: 'doc', ...meta })
   }
 
   return c.json({ error: 'not_found' }, 404)
 })
 
+// Delete an image or doc by id. The link/id is the capability — anyone holding
+// it can delete the file (no accounts exist). Frees the global storage counter
+// and refunds the original uploader's daily quota when they delete a file they
+// uploaded today (see refundDaily).
+app.post('/api/delete', async (c) => {
+  const ip = clientIp(c.req.raw)
+  let body: { id?: unknown }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'bad_request' }, 400)
+  }
+  const id = String(body.id ?? '')
+  if (!isValidId(id)) return c.json({ error: 'bad_id' }, 400)
+
+  const img = await c.env.BUCKET.head(`img/${id}.webp`)
+  if (img) {
+    const size = img.size
+    const uploadedAt = Number(img.customMetadata?.uploadedAt ?? img.uploaded.getTime())
+    const uploaderTag = img.customMetadata?.uploaderTag
+    await c.env.BUCKET.delete(`img/${id}.webp`)
+    await c.env.BUCKET.delete(`img/${id}.ocr.json`)
+    await addStorageUsed(c.env.QUOTA, -size)
+    await refundDaily(c.env.QUOTA, ip, size, uploadedAt, uploaderTag)
+    return c.json({ deleted: true, kind: 'image' })
+  }
+
+  const doc = await c.env.BUCKET.head(`doc/${id}`)
+  if (doc) {
+    const size = doc.size
+    let uploadedAt = 0
+    let uploaderTag: string | undefined
+    let finalized = false
+    const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
+    if (metaObj) {
+      const meta = await metaObj.json<Record<string, unknown>>()
+      uploadedAt = Number(meta.uploadedAt ?? 0)
+      uploaderTag = typeof meta.uploaderTag === 'string' ? meta.uploaderTag : undefined
+      finalized = meta.finalized === true
+    }
+    await c.env.BUCKET.delete(`doc/${id}`)
+    await c.env.BUCKET.delete(`meta/${id}.json`)
+    // Only un-charge bytes the counter was actually charged (docs are charged
+    // at /finalize). An un-finalized orphan never hit the counter.
+    if (finalized) await addStorageUsed(c.env.QUOTA, -size)
+    await refundDaily(c.env.QUOTA, ip, size, uploadedAt, uploaderTag)
+    return c.json({ deleted: true, kind: 'doc' })
+  }
+
+  return c.json({ error: 'not_found' }, 404)
+})
+
 // ----------------------------------------------------------------------------
+function capBytes(env: Bindings): number {
+  return Number(env.MAX_TOTAL_BYTES) || 9_000_000_000
+}
+
 function clientIp(req: Request): string {
   return (
     req.headers.get('cf-connecting-ip') ??
@@ -508,4 +589,11 @@ function rfc5987Value(name: string): string {
   )
 }
 
-export default app
+export default {
+  fetch: (req: Request, env: Bindings, ctx: ExecutionContext) => app.fetch(req, env, ctx),
+  // Cron (see wrangler.toml [triggers]): re-sum the bucket so storage that the
+  // 24h lifecycle rule deleted gets subtracted from the counter.
+  scheduled: (_event: ScheduledController, env: Bindings, ctx: ExecutionContext) => {
+    ctx.waitUntil(reconcileStorage(env.QUOTA, env.BUCKET))
+  },
+}

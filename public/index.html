@@ -167,6 +167,8 @@
   .btn:hover { background: #201b30; border-color: #4a4264; color: var(--accent); }
   .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
   .btn.primary:hover { background: #b9a3fb; border-color: #b9a3fb; color: var(--accent-fg); }
+  .btn.danger { color: var(--text-dim); }
+  .btn.danger:hover { background: rgba(239,68,68,0.12); border-color: var(--danger); color: var(--danger); }
   .btn[disabled] { opacity: .5; cursor: not-allowed; }
   .btn .ico { width: 12px; height: 12px; }
   .meta { color: var(--text-dim); font-size: 11px; margin-top: auto; font-family: var(--mono); }
@@ -303,9 +305,34 @@
     saveRecent(items)
     renderRecent()
   }
+  function removeRecent(id) {
+    saveRecent(loadRecent().filter((x) => x.id !== id))
+    renderRecent()
+  }
   function removeExpired() {
     const now = Date.now()
     saveRecent(loadRecent().filter((x) => x.expiresAt > now))
+  }
+
+  // Delete from the server (frees storage + refunds today's quota), then drop
+  // it from local history.
+  async function deleteItem(item, btn) {
+    if (!confirm(`Delete "${item.filename || item.id}" from the server? This frees up storage and your daily quota.`)) return
+    if (btn) { btn.disabled = true; btn.innerHTML = `${svgTrash()} ...` }
+    try {
+      const res = await fetch('/api/delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: item.id }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok && res.status !== 404) throw new Error(data.error || `http ${res.status}`)
+      removeRecent(item.id)
+      toast('deleted')
+    } catch (e) {
+      toast(`delete failed: ${e.message}`)
+      if (btn) { btn.disabled = false; btn.innerHTML = `${svgTrash()} Delete` }
+    }
   }
 
   // ----- formatters -----
@@ -466,6 +493,13 @@
       copy(cmd, 'cURL copied')
     })
     actions.appendChild(curlBtn)
+
+    const delBtn = document.createElement('button')
+    delBtn.className = 'btn danger'
+    delBtn.innerHTML = `${svgTrash()} Delete`
+    delBtn.addEventListener('click', () => deleteItem(item, delBtn))
+    actions.appendChild(delBtn)
+
     body.appendChild(actions)
 
     // meta
@@ -507,6 +541,7 @@
   function svgScan() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>' }
   function svgDownload() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' }
   function svgFile() { return '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' }
+  function svgTrash() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' }
 
   // ----- OCR (images only) -----
   let ocrModalOwner = null
@@ -614,6 +649,7 @@
       const err = data.error || `http ${res.status}`
       if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
       if (err === 'too_large') throw new Error('too large after compression')
+      if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
       throw new Error(err)
     }
     pushRecent({ kind: 'image', id: data.id, url: data.url, uploadedAt: data.uploadedAt, expiresAt: data.expiresAt, size: data.size })
@@ -647,6 +683,7 @@
       if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
       if (err === 'daily_count') throw new Error('daily upload limit reached')
       if (err === 'daily_bytes') throw new Error('daily size limit reached')
+      if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
       if (err === 'too_large') throw new Error('file too large (300 MB max)')
       throw new Error(err)
     }
