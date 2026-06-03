@@ -82,6 +82,11 @@ function nonNegativeNumber(value: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
+// Read the requester's current daily usage without charging it (for /api/usage).
+export async function readDailyUsage(kv: KVNamespace, ip: string): Promise<DailyQuota> {
+  return readQuota(kv, ip)
+}
+
 export type QuotaCheck =
   | { ok: true }
   | { ok: false; reason: 'daily_count' | 'daily_bytes'; limit: number }

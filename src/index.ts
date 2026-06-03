@@ -5,11 +5,13 @@ import indexHtml from '../public/index.html'
 import llmsTxt from '../public/llms.txt'
 import ogPng from '../public/og.png'
 import ogSvg from '../public/og.svg'
+import icon192 from '../public/icon-192.png'
+import icon512 from '../public/icon-512.png'
 import { generateId, isValidId } from './id'
 import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
-import { checkAndChargeDaily, hashIp, refundChargedDaily, refundDaily } from './ratelimit'
-import { addStorageUsed, reconcileStorage, withinStorageCap } from './storage'
+import { checkAndChargeDaily, hashIp, readDailyUsage, refundChargedDaily, refundDaily } from './ratelimit'
+import { addStorageUsed, getStorageUsed, reconcileStorage, withinStorageCap } from './storage'
 
 // Hard ceiling on the simple PUT /upload/:filename route. CF Workers cap the
 // request body at 100MB on Free/Pro. For files larger than this, clients must
@@ -108,6 +110,43 @@ app.get('/og.png', (c) => {
       'cache-control': 'public, max-age=86400, immutable',
     },
   })
+})
+
+// ---- PWA: manifest, icons, and a minimal service worker (installable + an
+// Android/desktop share target that drops shared text/links into a snippet). ----
+const pngHeaders = { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400, immutable' }
+app.get('/icon-192.png', () => new Response(icon192, { headers: pngHeaders }))
+app.get('/icon-512.png', () => new Response(icon512, { headers: pngHeaders }))
+
+app.get('/manifest.webmanifest', (c) => {
+  c.header('content-type', 'application/manifest+json; charset=utf-8')
+  c.header('cache-control', 'public, max-age=3600')
+  return c.body(JSON.stringify({
+    name: 'docshare', short_name: 'docshare',
+    description: 'Share files, images & video with coding agents. 24h auto-delete.',
+    start_url: '/', scope: '/', display: 'standalone',
+    background_color: '#0b0a10', theme_color: '#a78bfa',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+    ],
+    // GET share target: shared text/links land as ?text/?url and become a
+    // snippet upload on load. (File sharing would need a POST + SW handler.)
+    share_target: { action: '/', method: 'GET', params: { title: 'title', text: 'text', url: 'url' } },
+  }))
+})
+
+app.get('/sw.js', (c) => {
+  c.header('content-type', 'application/javascript; charset=utf-8')
+  c.header('cache-control', 'no-cache')
+  // No caching (this is a 24h-ephemeral tool — stale shells would be worse than
+  // a network round-trip). The empty fetch handler just satisfies the install
+  // criteria so the browser offers "Install app".
+  return c.body(
+    "self.addEventListener('install',e=>self.skipWaiting());" +
+    "self.addEventListener('activate',e=>self.clients.claim());" +
+    "self.addEventListener('fetch',()=>{});"
+  )
 })
 
 // One-shot upload for files <= 100MB. Body is the raw file bytes; the response
@@ -560,6 +599,25 @@ function returnedRangeBounds(range: R2Range, total: number): { start: number; le
   }
   return { start: 0, length: Math.min(range.length, total) }
 }
+
+// Usage for the requester (their daily quota) + the shared storage cap. Used
+// by the UI's usage bars. Read-only — never charges anything.
+app.get('/api/usage', async (c) => {
+  const ip = clientIp(c.req.raw)
+  const [used, daily] = await Promise.all([
+    getStorageUsed(c.env.QUOTA),
+    readDailyUsage(c.env.QUOTA, ip),
+  ])
+  return c.json({
+    storage: { used, cap: capBytes(c.env) },
+    daily: {
+      count: daily.count,
+      countMax: Number(c.env.DOC_DAILY_COUNT) || 5,
+      bytes: daily.bytes,
+      bytesMax: Number(c.env.DOC_DAILY_BYTES) || 1572864000,
+    },
+  })
+})
 
 // Metadata for either an image (id) or a doc (id).
 app.get('/api/info/:id', async (c) => {
