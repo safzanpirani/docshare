@@ -8,7 +8,7 @@ import ogSvg from '../public/og.svg'
 import { generateId, isValidId } from './id'
 import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
-import { checkAndChargeDaily, hashIp, refundDaily } from './ratelimit'
+import { checkAndChargeDaily, hashIp, refundChargedDaily, refundDaily } from './ratelimit'
 import { addStorageUsed, reconcileStorage, withinStorageCap } from './storage'
 
 // Hard ceiling on the simple PUT /upload/:filename route. CF Workers cap the
@@ -63,6 +63,17 @@ type Bindings = {
   R2_BUCKET_NAME: string
   R2_ACCESS_KEY_ID: string
   R2_SECRET_ACCESS_KEY: string
+}
+
+type DocMeta = {
+  filename?: string
+  contentType?: string
+  size?: number
+  chargedSize?: number
+  uploadedAt?: number
+  expiresAt?: number
+  finalized?: boolean
+  uploaderTag?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -133,25 +144,57 @@ app.put('/upload/:filename', async (c) => {
   const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, dailyCount, dailyBytes)
   if (!quota.ok) return c.text(`${quota.reason} (limit ${quota.limit})\n`, 429)
 
+  let id = ''
+  let storageCharged = 0
   const buf = await c.req.arrayBuffer()
-  if (buf.byteLength === 0) return c.text('empty\n', 400)
-  if (buf.byteLength > SIMPLE_UPLOAD_MAX) return c.text('too_large\n', 413)
+  if (buf.byteLength === 0) {
+    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    return c.text('empty\n', 400)
+  }
+  if (buf.byteLength > SIMPLE_UPLOAD_MAX) {
+    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    return c.text('too_large\n', 413)
+  }
+  if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, capBytes(c.env)))) {
+    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    return c.text('storage_full: service storage cap reached, try again later\n', 507)
+  }
 
-  let id = generateId(16)
+  id = generateId(16)
   if (await c.env.BUCKET.head(`doc/${id}`)) id = generateId(16)
 
   const uploadedAt = Date.now()
   const ttlHours = Number(c.env.TTL_HOURS) || 24
   const expiresAt = uploadedAt + ttlHours * 3600 * 1000
 
-  await c.env.BUCKET.put(`doc/${id}`, buf, {
-    httpMetadata: { contentType },
-  })
-  const meta = { filename, contentType, size: buf.byteLength, uploadedAt, expiresAt, finalized: true, uploaderTag: await hashIp(ip) }
-  await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
-    httpMetadata: { contentType: 'application/json' },
-  })
-  await addStorageUsed(c.env.QUOTA, buf.byteLength)
+  try {
+    await c.env.BUCKET.put(`doc/${id}`, buf, {
+      httpMetadata: { contentType },
+    })
+    const meta: DocMeta = {
+      filename,
+      contentType,
+      size: buf.byteLength,
+      chargedSize: declared,
+      uploadedAt,
+      expiresAt,
+      finalized: true,
+      uploaderTag: await hashIp(ip),
+    }
+    await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
+      httpMetadata: { contentType: 'application/json' },
+    })
+    await addStorageUsed(c.env.QUOTA, buf.byteLength)
+    storageCharged = buf.byteLength
+  } catch (e) {
+    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    if (storageCharged > 0) await addStorageUsed(c.env.QUOTA, -storageCharged)
+    if (id) {
+      await c.env.BUCKET.delete(`doc/${id}`)
+      await c.env.BUCKET.delete(`meta/${id}.json`)
+    }
+    throw e
+  }
 
   const url = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
   c.header('content-type', 'text/plain; charset=utf-8')
@@ -188,11 +231,19 @@ app.post('/api/upload', async (c) => {
   if (await c.env.BUCKET.head(`img/${id}.webp`)) id = generateId(8)
 
   const uploadedAt = Date.now()
-  await c.env.BUCKET.put(`img/${id}.webp`, buf, {
-    httpMetadata: { contentType: 'image/webp' },
-    customMetadata: { uploadedAt: uploadedAt.toString(), uploaderTag: await hashIp(ip) },
-  })
-  await addStorageUsed(c.env.QUOTA, buf.byteLength)
+  let storageCharged = 0
+  try {
+    await c.env.BUCKET.put(`img/${id}.webp`, buf, {
+      httpMetadata: { contentType: 'image/webp' },
+      customMetadata: { uploadedAt: uploadedAt.toString(), uploaderTag: await hashIp(ip) },
+    })
+    await addStorageUsed(c.env.QUOTA, buf.byteLength)
+    storageCharged = buf.byteLength
+  } catch (e) {
+    if (storageCharged > 0) await addStorageUsed(c.env.QUOTA, -storageCharged)
+    await c.env.BUCKET.delete(`img/${id}.webp`)
+    throw e
+  }
 
   const ttlHours = Number(c.env.TTL_HOURS) || 24
   const expiresAt = uploadedAt + ttlHours * 3600 * 1000
@@ -282,13 +333,6 @@ app.post('/api/doc/presign', async (c) => {
     return c.json({ error: 'storage_full' }, 507)
   }
 
-  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
-  const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 300 * 1024 * 1024
-  const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, dailyCount, dailyBytes)
-  if (!quota.ok) {
-    return c.json({ error: quota.reason, limit: quota.limit }, 429)
-  }
-
   let id = generateId(16)
   if (await c.env.BUCKET.head(`doc/${id}`)) id = generateId(16)
 
@@ -296,16 +340,38 @@ app.post('/api/doc/presign', async (c) => {
   const ttlHours = Number(c.env.TTL_HOURS) || 24
   const expiresAt = uploadedAt + ttlHours * 3600 * 1000
 
-  const meta = { filename, contentType, size, uploadedAt, expiresAt, finalized: false, uploaderTag: await hashIp(ip) }
-  await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
-    httpMetadata: { contentType: 'application/json' },
-  })
-
   let putUrl: string
   try {
     putUrl = await presignPutUrl(c.env, `doc/${id}`)
   } catch (e) {
     return c.json({ error: 'presign_failed', message: (e as Error).message }, 500)
+  }
+
+  const uploaderTag = await hashIp(ip)
+  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
+  const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 300 * 1024 * 1024
+  const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, dailyCount, dailyBytes)
+  if (!quota.ok) {
+    return c.json({ error: quota.reason, limit: quota.limit }, 429)
+  }
+
+  const meta: DocMeta = {
+    filename,
+    contentType,
+    size,
+    chargedSize: size,
+    uploadedAt,
+    expiresAt,
+    finalized: false,
+    uploaderTag,
+  }
+  try {
+    await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
+      httpMetadata: { contentType: 'application/json' },
+    })
+  } catch (e) {
+    await refundChargedDaily(c.env.QUOTA, ip, size)
+    throw e
   }
 
   const downloadUrl = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
@@ -316,6 +382,7 @@ app.post('/api/doc/presign', async (c) => {
 // real size. A presigned PUT can't enforce a max size, so we verify here and
 // delete anything that came in over the limit.
 app.post('/api/doc/finalize', async (c) => {
+  const ip = clientIp(c.req.raw)
   let body: { id?: unknown }
   try {
     body = await c.req.json()
@@ -328,27 +395,55 @@ app.post('/api/doc/finalize', async (c) => {
   const obj = await c.env.BUCKET.head(`doc/${id}`)
   if (!obj) return c.json({ error: 'not_found' }, 404)
 
+  const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
+  const meta = metaObj ? await metaObj.json<DocMeta>() : undefined
+  if (!meta) {
+    await c.env.BUCKET.delete(`doc/${id}`)
+    return c.json({ error: 'not_found' }, 404)
+  }
+  const alreadyFinalized = meta?.finalized === true
+  const previousFinalizedSize = alreadyFinalized ? nonNegative(meta?.size) : 0
+  const chargedSize = chargedDocSize(meta, obj.size)
+  const uploadedAt = Number(meta?.uploadedAt ?? 0)
+  const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
+
   const maxDoc = Number(c.env.MAX_DOC_BYTES) || 100 * 1024 * 1024
   if (obj.size > maxDoc) {
     await c.env.BUCKET.delete(`doc/${id}`)
     await c.env.BUCKET.delete(`meta/${id}.json`)
+    if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
+    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
     return c.json({ error: 'too_large', max: maxDoc }, 413)
   }
 
-  const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
-  let alreadyFinalized = false
-  if (metaObj) {
-    const meta = await metaObj.json<Record<string, unknown>>()
-    alreadyFinalized = meta.finalized === true
+  const storageDelta = obj.size - previousFinalizedSize
+  if (storageDelta > 0 && !(await withinStorageCap(c.env.QUOTA, storageDelta, capBytes(c.env)))) {
+    await c.env.BUCKET.delete(`doc/${id}`)
+    await c.env.BUCKET.delete(`meta/${id}.json`)
+    if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
+    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
+    return c.json({ error: 'storage_full' }, 507)
+  }
+
+  let storageAdjusted = 0
+  try {
+    if (storageDelta !== 0) {
+      await addStorageUsed(c.env.QUOTA, storageDelta)
+      storageAdjusted = storageDelta
+    }
     meta.size = obj.size
+    meta.chargedSize = chargedSize
     meta.finalized = true
     await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
       httpMetadata: { contentType: 'application/json' },
     })
+  } catch (e) {
+    if (storageAdjusted !== 0) await addStorageUsed(c.env.QUOTA, -storageAdjusted)
+    throw e
   }
-  // Charge the global storage counter with the real object size, exactly once
-  // (finalize is idempotent — a re-finalize must not double-count).
-  if (!alreadyFinalized) await addStorageUsed(c.env.QUOTA, obj.size)
+  // Charge the global storage counter with the real object size. Re-finalize is
+  // idempotent unless the still-valid presigned PUT overwrote the same key; then
+  // adjust by the size delta.
   return c.json({ id, size: obj.size, finalized: true })
 })
 
@@ -514,34 +609,30 @@ app.post('/api/delete', async (c) => {
   const img = await c.env.BUCKET.head(`img/${id}.webp`)
   if (img) {
     const size = img.size
-    const uploadedAt = Number(img.customMetadata?.uploadedAt ?? img.uploaded.getTime())
-    const uploaderTag = img.customMetadata?.uploaderTag
     await c.env.BUCKET.delete(`img/${id}.webp`)
     await c.env.BUCKET.delete(`img/${id}.ocr.json`)
     await addStorageUsed(c.env.QUOTA, -size)
-    await refundDaily(c.env.QUOTA, ip, size, uploadedAt, uploaderTag)
     return c.json({ deleted: true, kind: 'image' })
   }
 
   const doc = await c.env.BUCKET.head(`doc/${id}`)
-  if (doc) {
-    const size = doc.size
-    let uploadedAt = 0
-    let uploaderTag: string | undefined
-    let finalized = false
-    const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
-    if (metaObj) {
-      const meta = await metaObj.json<Record<string, unknown>>()
-      uploadedAt = Number(meta.uploadedAt ?? 0)
-      uploaderTag = typeof meta.uploaderTag === 'string' ? meta.uploaderTag : undefined
-      finalized = meta.finalized === true
-    }
-    await c.env.BUCKET.delete(`doc/${id}`)
+  const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
+  const meta = metaObj ? await metaObj.json<DocMeta>() : undefined
+  if (doc || meta) {
+    const chargedSize = chargedDocSize(meta, doc?.size ?? 0)
+    const uploadedAt = Number(meta?.uploadedAt ?? 0)
+    const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
+    const finalized = meta?.finalized === true
+    const finalizedSize = finalized ? nonNegative(meta?.size) : 0
+    if (doc) await c.env.BUCKET.delete(`doc/${id}`)
     await c.env.BUCKET.delete(`meta/${id}.json`)
     // Only un-charge bytes the counter was actually charged (docs are charged
     // at /finalize). An un-finalized orphan never hit the counter.
-    if (finalized) await addStorageUsed(c.env.QUOTA, -size)
-    await refundDaily(c.env.QUOTA, ip, size, uploadedAt, uploaderTag)
+    if (finalizedSize > 0) await addStorageUsed(c.env.QUOTA, -finalizedSize)
+    if (doc && !meta) {
+      // TODO(review): Decide whether metadata-less doc orphans should subtract storage; without meta we cannot know whether /finalize charged them.
+    }
+    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
     return c.json({ deleted: true, kind: 'doc' })
   }
 
@@ -551,6 +642,15 @@ app.post('/api/delete', async (c) => {
 // ----------------------------------------------------------------------------
 function capBytes(env: Bindings): number {
   return Number(env.MAX_TOTAL_BYTES) || 9_000_000_000
+}
+
+function chargedDocSize(meta: DocMeta | undefined, fallback: number): number {
+  return nonNegative(meta?.chargedSize) || nonNegative(meta?.size) || nonNegative(fallback)
+}
+
+function nonNegative(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 function clientIp(req: Request): string {

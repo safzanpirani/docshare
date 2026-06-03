@@ -14,8 +14,8 @@ function utcDay(d = new Date()): string {
   return d.toISOString().slice(0, 10) // UTC YYYY-MM-DD
 }
 
-function quotaKey(ip: string, day = utcDay()): string {
-  return `quota:${day}:${ip}`
+function quotaKey(tag: string, day = utcDay()): string {
+  return `quota:${day}:${tag}`
 }
 
 // Stable, non-reversible-ish tag for the uploader's IP. Stored in metadata so a
@@ -26,6 +26,10 @@ export async function hashIp(ip: string): Promise<string> {
   const data = new TextEncoder().encode(`docshare:${ip}`)
   const digest = await crypto.subtle.digest('SHA-256', data)
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+async function quotaKeyForIp(ip: string): Promise<string> {
+  return quotaKey(await hashIp(ip))
 }
 
 // Give back one upload's worth of daily quota when the uploader deletes a file
@@ -42,23 +46,40 @@ export async function refundDaily(
   if (utcDay(new Date(uploadedAt)) !== utcDay()) return // only today's counter is live
   if (!uploaderTag || (await hashIp(ip)) !== uploaderTag) return // only the original uploader
 
+  await refundChargedDaily(kv, ip, size)
+}
+
+// Undo a quota charge from the same request/IP after a later upload step fails.
+export async function refundChargedDaily(
+  kv: KVNamespace,
+  ip: string,
+  size: number,
+): Promise<void> {
   const cur = await readQuota(kv, ip)
   const next: DailyQuota = {
     count: Math.max(0, cur.count - 1),
-    bytes: Math.max(0, cur.bytes - Math.max(0, size)),
+    bytes: Math.max(0, cur.bytes - nonNegativeNumber(size)),
   }
-  await kv.put(quotaKey(ip), JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
+  await kv.put(await quotaKeyForIp(ip), JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
 }
 
 async function readQuota(kv: KVNamespace, ip: string): Promise<DailyQuota> {
-  const raw = await kv.get(quotaKey(ip))
+  const raw = await kv.get(await quotaKeyForIp(ip))
   if (!raw) return { count: 0, bytes: 0 }
   try {
     const parsed = JSON.parse(raw) as DailyQuota
-    return { count: parsed.count ?? 0, bytes: parsed.bytes ?? 0 }
+    return {
+      count: nonNegativeNumber(parsed.count),
+      bytes: nonNegativeNumber(parsed.bytes),
+    }
   } catch {
     return { count: 0, bytes: 0 }
   }
+}
+
+function nonNegativeNumber(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 export type QuotaCheck =
@@ -72,15 +93,16 @@ export async function checkAndChargeDaily(
   maxCount: number,
   maxBytes: number,
 ): Promise<QuotaCheck> {
+  const bytesToAdd = nonNegativeNumber(addBytes)
   const cur = await readQuota(kv, ip)
   if (cur.count >= maxCount) {
     return { ok: false, reason: 'daily_count', limit: maxCount }
   }
-  if (cur.bytes + addBytes > maxBytes) {
+  if (cur.bytes + bytesToAdd > maxBytes) {
     return { ok: false, reason: 'daily_bytes', limit: maxBytes }
   }
-  const next: DailyQuota = { count: cur.count + 1, bytes: cur.bytes + addBytes }
-  await kv.put(quotaKey(ip), JSON.stringify(next), {
+  const next: DailyQuota = { count: cur.count + 1, bytes: cur.bytes + bytesToAdd }
+  await kv.put(await quotaKeyForIp(ip), JSON.stringify(next), {
     expirationTtl: DAY_TTL_SECONDS,
   })
   return { ok: true }

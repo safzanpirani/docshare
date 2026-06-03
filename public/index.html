@@ -143,6 +143,23 @@
   .media-preview audio { width: 100%; height: 100%; display: block; background: #000; }
   .media-preview.audio { aspect-ratio: auto; height: 44px; background: transparent; }
   .media-preview.audio media-controller { height: 44px; }
+  /* code/text preview */
+  .code-preview { width: 100%; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #0c0a13; }
+  .code-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 10px; background: #14111d; border-bottom: 1px solid var(--border);
+  }
+  .code-lang { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); }
+  .code-copy { background: transparent; border: none; color: var(--text-dim); padding: 2px; display: grid; place-items: center; border-radius: 3px; }
+  .code-copy:hover:not([disabled]) { color: var(--accent); }
+  .code-copy[disabled] { opacity: .4; cursor: default; }
+  .code-body {
+    margin: 0; max-height: 360px; overflow: auto; padding: 12px 14px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.55; tab-size: 2;
+    white-space: pre; color: var(--text);
+  }
+  .code-body code { font-family: inherit; white-space: pre; background: transparent; padding: 0; }
+  .code-trunc { padding: 7px 10px; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); border-top: 1px solid var(--border); background: #14111d; }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .thumb.doc { background: #1b1827; color: var(--text-dim); }
   .thumb.doc .ext {
@@ -194,6 +211,15 @@
   .modal-foot { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
   .icon-btn { background: transparent; border: none; color: var(--text-dim); padding: 4px; border-radius: 4px; display: grid; place-items: center; }
   .icon-btn:hover { color: var(--accent); background: var(--bg-card-hover); }
+
+  /* confirm dialog (replaces the native confirm() popup) */
+  .confirm-modal { max-width: 420px; border-top-color: var(--danger); }
+  .confirm-modal.neutral { border-top-color: var(--accent); }
+  .confirm-body { padding: 18px 18px 6px; }
+  .confirm-title { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+  .confirm-msg { font-size: 13px; color: var(--text-dim); line-height: 1.5; word-break: break-word; }
+  .btn.danger-solid { background: var(--danger); color: #fff; border-color: var(--danger); font-weight: 600; }
+  .btn.danger-solid:hover { background: #dc2626; border-color: #dc2626; color: #fff; }
 
   footer { margin-top: 64px; text-align: center; color: var(--text-faint); font-size: 11px; font-family: var(--mono); }
   footer a { color: var(--text-dim); }
@@ -251,6 +277,19 @@
   </div>
 </div>
 
+<div id="confirm" class="modal-back" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal confirm-modal">
+    <div class="confirm-body">
+      <div class="confirm-title" id="confirm-title"></div>
+      <div class="confirm-msg" id="confirm-msg"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="confirm-cancel">Cancel</button>
+      <button class="btn danger-solid" id="confirm-ok">Delete</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -284,6 +323,41 @@
     toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1600)
   }
 
+  // ----- in-page confirm dialog (replaces native confirm()) -----
+  function confirmDialog({ title, message, confirmLabel = 'Confirm', danger = false }) {
+    return new Promise((resolve) => {
+      const back = $('confirm')
+      const ok = $('confirm-ok')
+      const cancel = $('confirm-cancel')
+      $('confirm-title').textContent = title
+      $('confirm-msg').textContent = message
+      ok.textContent = confirmLabel
+      ok.className = 'btn ' + (danger ? 'danger-solid' : 'primary')
+      back.querySelector('.confirm-modal').classList.toggle('neutral', !danger)
+      back.classList.add('open')
+      const done = (val) => {
+        back.classList.remove('open')
+        ok.removeEventListener('click', onOk)
+        cancel.removeEventListener('click', onCancel)
+        back.removeEventListener('click', onBack)
+        document.removeEventListener('keydown', onKey)
+        resolve(val)
+      }
+      const onOk = () => done(true)
+      const onCancel = () => done(false)
+      const onBack = (e) => { if (e.target === back) done(false) }
+      const onKey = (e) => {
+        if (e.key === 'Escape') done(false)
+        else if (e.key === 'Enter') done(true)
+      }
+      ok.addEventListener('click', onOk)
+      cancel.addEventListener('click', onCancel)
+      back.addEventListener('click', onBack)
+      document.addEventListener('keydown', onKey)
+      ok.focus()
+    })
+  }
+
   // ----- recent storage -----
   function loadRecent() {
     try {
@@ -314,10 +388,16 @@
     saveRecent(loadRecent().filter((x) => x.expiresAt > now))
   }
 
-  // Delete from the server (frees storage + refunds today's quota), then drop
-  // it from local history.
+  // Delete from the server, then drop it from local history.
   async function deleteItem(item, btn) {
-    if (!confirm(`Delete "${item.filename || item.id}" from the server? This frees up storage and your daily quota.`)) return
+    const quotaNote = item.kind === 'doc' ? ', and refunds today’s quota when you’re the uploader' : ''
+    const okToDelete = await confirmDialog({
+      title: 'Delete this file?',
+      message: `“${item.filename || item.id}” will be removed from the server. This frees storage${quotaNote}.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!okToDelete) return
     if (btn) { btn.disabled = true; btn.innerHTML = `${svgTrash()} ...` }
     try {
       const res = await fetch('/api/delete', {
@@ -391,6 +471,90 @@
   const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv', 'mkv'])
   const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'wav', 'flac', 'oga', 'ogg', 'opus'])
 
+  // Code / text files get an inline syntax-highlighted preview. The map is
+  // extension → highlight.js language id; the value is just a hint (unknown
+  // langs fall back to auto-detect). Bytes are fetched and rendered as TEXT,
+  // never executed, so previewing an .html/.js/.svg is safe.
+  const PREVIEW_MAX_BYTES = 512 * 1024   // don't fetch big files for a preview
+  const PREVIEW_MAX_LINES = 2000         // cap rendered lines so highlight stays fast
+  const CODE_LANGS = {
+    py: 'python', pyw: 'python', pyi: 'python',
+    js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+    ts: 'typescript', tsx: 'typescript', mts: 'typescript', cts: 'typescript',
+    json: 'json', jsonc: 'json', json5: 'json', geojson: 'json', ipynb: 'json',
+    bat: 'dos', cmd: 'dos',
+    ps1: 'powershell', psm1: 'powershell', psd1: 'powershell',
+    vbs: 'vbscript', vb: 'vbnet', bas: 'vbnet',
+    sh: 'bash', bash: 'bash', zsh: 'bash', ksh: 'bash', fish: 'bash', env: 'bash',
+    rb: 'ruby', gemfile: 'ruby', rake: 'ruby',
+    go: 'go', rs: 'rust', java: 'java', kt: 'kotlin', kts: 'kotlin',
+    c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp', hh: 'cpp', hxx: 'cpp',
+    cs: 'csharp', php: 'php', swift: 'swift', scala: 'scala', sc: 'scala',
+    lua: 'lua', pl: 'perl', pm: 'perl', r: 'r', sql: 'sql',
+    yaml: 'yaml', yml: 'yaml', toml: 'ini', ini: 'ini', cfg: 'ini', conf: 'ini',
+    properties: 'ini', editorconfig: 'ini', npmrc: 'ini',
+    xml: 'xml', html: 'xml', htm: 'xml', xhtml: 'xml', svg: 'xml', plist: 'xml',
+    xaml: 'xml', vue: 'xml', svelte: 'xml', astro: 'xml',
+    css: 'css', scss: 'scss', sass: 'scss', less: 'less',
+    md: 'markdown', markdown: 'markdown', mdx: 'markdown',
+    txt: 'plaintext', text: 'plaintext', log: 'plaintext', csv: 'plaintext', tsv: 'plaintext',
+    dockerfile: 'dockerfile', makefile: 'makefile', mk: 'makefile', cmake: 'cmake',
+    gradle: 'groovy', groovy: 'groovy',
+    diff: 'diff', patch: 'diff',
+    tex: 'latex', dart: 'dart', ex: 'elixir', exs: 'elixir',
+    erl: 'erlang', hrl: 'erlang', hs: 'haskell',
+    clj: 'clojure', cljs: 'clojure', cljc: 'clojure', edn: 'clojure',
+    m: 'objectivec', mm: 'objectivec', asm: 'x86asm', s: 'x86asm',
+    fs: 'fsharp', fsx: 'fsharp', ml: 'ocaml', mli: 'ocaml',
+    nim: 'nim', zig: 'zig', jl: 'julia', proto: 'protobuf',
+    graphql: 'graphql', gql: 'graphql', gitignore: 'plaintext', dockerignore: 'plaintext',
+  }
+  // Some files carry the language in the *name* rather than an extension.
+  const CODE_NAMES = {
+    dockerfile: 'dockerfile', makefile: 'makefile', '.gitignore': 'plaintext',
+    '.env': 'bash', '.npmrc': 'ini', '.editorconfig': 'ini', gemfile: 'ruby',
+    rakefile: 'ruby', 'cmakelists.txt': 'cmake',
+  }
+  function codeLangFor(item) {
+    const name = (item.filename || '').toLowerCase()
+    if (CODE_NAMES[name]) return CODE_NAMES[name]
+    const ext = extOf(item.filename || '').toLowerCase()
+    return CODE_LANGS[ext] || null
+  }
+
+  // Lazy-load highlight.js + dark theme once, the first time a code item is
+  // shown. The default esm entry only registers the ~common languages, so we
+  // additionally register the extras our map needs (dos/.bat, powershell/.ps1,
+  // vbscript/.vbs, and other non-common grammars). Unregistered langs still
+  // degrade to highlightAuto, so missing one isn't fatal.
+  const HLJS_EXTRA_LANGS = [
+    'dos', 'powershell', 'vbscript', 'vbnet', 'dockerfile', 'scala', 'dart',
+    'elixir', 'erlang', 'haskell', 'clojure', 'fsharp', 'ocaml', 'julia',
+    'nim', 'zig', 'latex', 'x86asm', 'protobuf', 'cmake', 'groovy',
+  ]
+  let hljsPromise = null
+  function getHljs() {
+    if (!hljsPromise) {
+      const link = document.createElement('link')
+      link.rel = 'stylesheet'
+      link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css'
+      document.head.appendChild(link)
+      const base = 'https://esm.sh/highlight.js@11.10.0'
+      hljsPromise = import(`${base}/lib/common`).then(async (m) => {
+        const hljs = m.default || m
+        await Promise.all(HLJS_EXTRA_LANGS.map(async (name) => {
+          if (hljs.getLanguage(name)) return
+          try {
+            const lm = await import(`${base}/lib/languages/${name}`)
+            hljs.registerLanguage(name, lm.default || lm)
+          } catch { /* grammar unavailable — auto-detect will cover it */ }
+        }))
+        return hljs
+      })
+    }
+    return hljsPromise
+  }
+
   function itemEl(item) {
     const isDoc = item.kind === 'doc'
     const ct = (isDoc && item.contentType) || ''
@@ -401,14 +565,20 @@
     const isVideo = isDoc && (ct.startsWith('video/') || VIDEO_EXTS.has(ext))
     const isAudio = isDoc && (ct.startsWith('audio/') || AUDIO_EXTS.has(ext))
     const isMedia = isVideo || isAudio
+    const codeLang = isDoc && !isMedia ? codeLangFor(item) : null
+    const isCode = !!codeLang
+    const isWide = isMedia || isCode
 
     const el = document.createElement('div')
-    el.className = 'item' + (isMedia ? ' media' : '')
+    el.className = 'item' + (isWide ? ' media' : '')
     el.dataset.id = item.id
 
     if (isMedia) {
       // Full-width inline player for video/audio uploads.
       el.appendChild(mediaPlayerEl(item, isVideo ? 'video' : 'audio'))
+    } else if (isCode) {
+      // Full-width syntax-highlighted preview for code/text uploads.
+      el.appendChild(codePreviewEl(item, codeLang))
     } else if (isDoc) {
       const thumb = document.createElement('div')
       thumb.className = 'thumb doc'
@@ -536,6 +706,90 @@
   }
   function escapeAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  // Inline syntax-highlighted preview for a code/text upload. The file is
+  // fetched (same-origin) and rendered as TEXT — never executed — and lazily,
+  // only once the card scrolls into view.
+  function codePreviewEl(item, lang) {
+    const wrap = document.createElement('div')
+    wrap.className = 'code-preview'
+
+    const head = document.createElement('div')
+    head.className = 'code-head'
+    const label = document.createElement('span')
+    label.className = 'code-lang'
+    label.textContent = lang === 'plaintext' ? 'text' : lang
+    head.appendChild(label)
+    const copyBtn = document.createElement('button')
+    copyBtn.className = 'code-copy'
+    copyBtn.title = 'copy code'
+    copyBtn.innerHTML = svgCopy()
+    copyBtn.disabled = true
+    head.appendChild(copyBtn)
+    wrap.appendChild(head)
+
+    const pre = document.createElement('pre')
+    pre.className = 'code-body'
+    const code = document.createElement('code')
+    code.textContent = 'loading preview…'
+    pre.appendChild(code)
+    wrap.appendChild(pre)
+
+    if (item.size && item.size > PREVIEW_MAX_BYTES) {
+      code.textContent = `preview skipped — ${fmtSize(item.size)} file (over ${fmtSize(PREVIEW_MAX_BYTES)}). Download to view.`
+      return wrap
+    }
+
+    let loaded = false
+    const load = async () => {
+      if (loaded) return
+      loaded = true
+      try {
+        const res = await fetch(item.url)
+        if (!res.ok) throw new Error(`http ${res.status}`)
+        let text = await res.text()
+        const lines = text.split('\n')
+        let truncated = false
+        if (lines.length > PREVIEW_MAX_LINES) {
+          text = lines.slice(0, PREVIEW_MAX_LINES).join('\n')
+          truncated = true
+        }
+        const hljs = await getHljs()
+        let html
+        try {
+          html = hljs.getLanguage(lang)
+            ? hljs.highlight(text, { language: lang, ignoreIllegals: true }).value
+            : hljs.highlightAuto(text).value
+        } catch {
+          html = null
+        }
+        if (html != null) code.innerHTML = html
+        else code.textContent = text
+        code.classList.add('hljs')
+        if (truncated) {
+          const note = document.createElement('div')
+          note.className = 'code-trunc'
+          note.textContent = `… truncated to first ${PREVIEW_MAX_LINES} lines — download for the full file`
+          wrap.appendChild(note)
+        }
+        copyBtn.disabled = false
+        copyBtn.addEventListener('click', () => copy(text, truncated ? 'copied (truncated)' : 'code copied'))
+      } catch (e) {
+        code.textContent = `preview unavailable (${e.message})`
+      }
+    }
+
+    // Lazy: only fetch + highlight when the card is actually on screen.
+    if ('IntersectionObserver' in window) {
+      const io = new IntersectionObserver((entries, obs) => {
+        if (entries.some((en) => en.isIntersecting)) { obs.disconnect(); load() }
+      }, { rootMargin: '200px' })
+      io.observe(wrap)
+    } else {
+      load()
+    }
+    return wrap
   }
   function svgCopy() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' }
   function svgScan() { return '<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>' }
@@ -701,16 +955,20 @@
       progress.classList.remove('show')
     }
 
-    // confirm + enforce real size (best-effort)
-    try {
-      await fetch('/api/doc/finalize', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: presign.id }),
-      })
-    } catch {}
+    const finalizeRes = await fetch('/api/doc/finalize', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: presign.id }),
+    })
+    const finalized = await finalizeRes.json().catch(() => ({}))
+    if (!finalizeRes.ok) {
+      const err = finalized.error || `http ${finalizeRes.status}`
+      if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
+      if (err === 'too_large') throw new Error('file too large (300 MB max)')
+      throw new Error(err)
+    }
 
-    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, contentType: file.type || 'application/octet-stream', uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: file.size })
+    pushRecent({ kind: 'doc', id: presign.id, url: presign.downloadUrl, filename: presign.filename, contentType: file.type || 'application/octet-stream', uploadedAt: presign.uploadedAt, expiresAt: presign.expiresAt, size: finalized.size || file.size })
     copy(presign.downloadUrl, 'uploaded · URL copied')
     setStatus('')
   }
@@ -765,9 +1023,15 @@
     }
   })
 
-  $('clear-recent').addEventListener('click', (e) => {
+  $('clear-recent').addEventListener('click', async (e) => {
     e.preventDefault()
-    if (confirm('clear local upload history? (does not delete uploads from server)')) {
+    const ok = await confirmDialog({
+      title: 'Clear local history?',
+      message: 'This only clears the list shown here — it does not delete the uploads from the server.',
+      confirmLabel: 'Clear',
+      danger: false,
+    })
+    if (ok) {
       localStorage.removeItem(RECENT_KEY)
       renderRecent()
     }
