@@ -65,6 +65,17 @@ type Bindings = {
   R2_BUCKET_NAME: string
   R2_ACCESS_KEY_ID: string
   R2_SECRET_ACCESS_KEY: string
+  // Optional shared password that lets the owner bypass the per-IP daily cap.
+  // Set as a secret; unset means no bypass exists.
+  ADMIN_KEY: string
+}
+
+// True when the request carries the owner's admin password, granting a bypass
+// of the per-IP daily upload cap. A blank/unset ADMIN_KEY means no bypass.
+function isAdmin(c: { env: Bindings; req: { header: (n: string) => string | undefined } }): boolean {
+  const key = c.env.ADMIN_KEY
+  if (!key) return false
+  return c.req.header('x-admin-key') === key
 }
 
 type DocMeta = {
@@ -178,24 +189,28 @@ app.put('/upload/:filename', async (c) => {
     return c.text('storage_full: service storage cap reached, try again later\n', 507)
   }
 
-  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
+  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 10
   const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 1572864000
-  const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, dailyCount, dailyBytes)
-  if (!quota.ok) return c.text(`${quota.reason} (limit ${quota.limit})\n`, 429)
+  const charged = !isAdmin(c)
+  if (charged) {
+    const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, dailyCount, dailyBytes)
+    if (!quota.ok) return c.text(`${quota.reason} (limit ${quota.limit})\n`, 429)
+  }
+  const refund = async () => { if (charged) await refundChargedDaily(c.env.QUOTA, ip, declared) }
 
   let id = ''
   let storageCharged = 0
   const buf = await c.req.arrayBuffer()
   if (buf.byteLength === 0) {
-    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    await refund()
     return c.text('empty\n', 400)
   }
   if (buf.byteLength > SIMPLE_UPLOAD_MAX) {
-    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    await refund()
     return c.text('too_large\n', 413)
   }
   if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, capBytes(c.env)))) {
-    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    await refund()
     return c.text('storage_full: service storage cap reached, try again later\n', 507)
   }
 
@@ -226,7 +241,7 @@ app.put('/upload/:filename', async (c) => {
     await addStorageUsed(c.env.QUOTA, buf.byteLength)
     storageCharged = buf.byteLength
   } catch (e) {
-    await refundChargedDaily(c.env.QUOTA, ip, declared)
+    await refund()
     if (storageCharged > 0) await addStorageUsed(c.env.QUOTA, -storageCharged)
     if (id) {
       await c.env.BUCKET.delete(`doc/${id}`)
@@ -250,8 +265,9 @@ app.post('/api/upload', async (c) => {
   if (!success) return c.json({ error: 'rate_limited' }, 429)
 
   const max = Number(c.env.MAX_UPLOAD_BYTES) || 15 * 1024 * 1024
+  const admin = isAdmin(c)
   const declared = Number(c.req.header('content-length') ?? '0')
-  if (declared && declared > max) return c.json({ error: 'too_large', max }, 413)
+  if (declared && declared > max && !admin) return c.json({ error: 'too_large', max }, 413)
 
   if ((c.req.header('content-type') ?? '') !== 'image/webp') {
     return c.json({ error: 'webp_required' }, 415)
@@ -259,7 +275,7 @@ app.post('/api/upload', async (c) => {
 
   const buf = await c.req.arrayBuffer()
   if (buf.byteLength === 0) return c.json({ error: 'empty' }, 400)
-  if (buf.byteLength > max) return c.json({ error: 'too_large', max }, 413)
+  if (buf.byteLength > max && !admin) return c.json({ error: 'too_large', max }, 413)
   if (!isWebp(buf)) return c.json({ error: 'webp_required' }, 415)
 
   if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, capBytes(c.env)))) {
@@ -364,7 +380,7 @@ app.post('/api/doc/presign', async (c) => {
 
   const maxDoc = Number(c.env.MAX_DOC_BYTES) || 100 * 1024 * 1024
   if (!Number.isFinite(size) || size <= 0) return c.json({ error: 'bad_size' }, 400)
-  if (size > maxDoc) return c.json({ error: 'too_large', max: maxDoc }, 413)
+  if (size > maxDoc && !isAdmin(c)) return c.json({ error: 'too_large', max: maxDoc }, 413)
 
   // Global storage cap. The bytes are charged to the counter at /finalize with
   // the real object size; here we only reject if the declared size wouldn't fit.
@@ -387,11 +403,14 @@ app.post('/api/doc/presign', async (c) => {
   }
 
   const uploaderTag = await hashIp(ip)
-  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 5
+  const dailyCount = Number(c.env.DOC_DAILY_COUNT) || 10
   const dailyBytes = Number(c.env.DOC_DAILY_BYTES) || 300 * 1024 * 1024
-  const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, dailyCount, dailyBytes)
-  if (!quota.ok) {
-    return c.json({ error: quota.reason, limit: quota.limit }, 429)
+  const charged = !isAdmin(c)
+  if (charged) {
+    const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, dailyCount, dailyBytes)
+    if (!quota.ok) {
+      return c.json({ error: quota.reason, limit: quota.limit }, 429)
+    }
   }
 
   const meta: DocMeta = {
@@ -409,7 +428,7 @@ app.post('/api/doc/presign', async (c) => {
       httpMetadata: { contentType: 'application/json' },
     })
   } catch (e) {
-    await refundChargedDaily(c.env.QUOTA, ip, size)
+    if (charged) await refundChargedDaily(c.env.QUOTA, ip, size)
     throw e
   }
 
@@ -447,7 +466,7 @@ app.post('/api/doc/finalize', async (c) => {
   const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
 
   const maxDoc = Number(c.env.MAX_DOC_BYTES) || 100 * 1024 * 1024
-  if (obj.size > maxDoc) {
+  if (obj.size > maxDoc && !isAdmin(c)) {
     await c.env.BUCKET.delete(`doc/${id}`)
     await c.env.BUCKET.delete(`meta/${id}.json`)
     if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
@@ -509,7 +528,31 @@ async function serveDoc(c: Context<{ Bindings: Bindings }>) {
     if (meta.contentType) contentType = normalizeContentType(meta.contentType)
   }
 
-  const inline = shouldServeInline(contentType)
+  // Text/code/markdown files get a styled full-page viewer when opened in a
+  // browser (Accept: text/html). `?raw=1` serves the plain text (git-raw
+  // style) and `?dl=1` forces a download — both are what agents/curl hit, so
+  // programmatic clients (no text/html in Accept) always get the raw bytes.
+  const rawParam = c.req.query('raw') != null
+  const dlParam = c.req.query('dl') != null
+  const isText = isViewableText(filename, contentType)
+  const isPdf = fileExt(filename) === 'pdf' || normalizeContentType(contentType) === 'application/pdf'
+  const wantsHtml = (c.req.header('accept') || '').includes('text/html')
+  if ((isText || isPdf) && wantsHtml && !rawParam && !dlParam) {
+    // `Vary: Accept` is essential: this URL returns HTML to browsers but raw
+    // bytes to `curl`/agents, so caches must key on Accept — otherwise a cached
+    // download variant gets replayed to a browser (shows up as a spurious
+    // download when clicking "View").
+    return c.html(viewerPage(id, filename, contentType), 200, {
+      'cache-control': 'public, max-age=300',
+      vary: 'Accept',
+    })
+  }
+
+  // When serving raw text, coerce the type to text/plain so a mislabelled
+  // .html/.svg upload can never execute as active content.
+  if (isText && rawParam) contentType = 'text/plain; charset=utf-8'
+
+  const inline = !dlParam && (shouldServeInline(contentType) || (isText && rawParam))
 
   // Parse a single-range `Range: bytes=start-end` header so HTML5 <video> can
   // seek without re-downloading. Suffix ranges are supported because some
@@ -532,6 +575,7 @@ async function serveDoc(c: Context<{ Bindings: Bindings }>) {
   headers.set('content-disposition', `${disposition}; filename="${asciiFilename(filename)}"; filename*=UTF-8''${rfc5987Value(filename)}`)
   headers.set('x-content-type-options', 'nosniff')
   headers.set('cache-control', 'public, max-age=300, immutable')
+  headers.set('vary', 'Accept') // same URL varies HTML-viewer vs raw bytes by Accept
   if (inline) headers.set('accept-ranges', 'bytes')
   if (obj.httpEtag) headers.set('etag', obj.httpEtag)
 
@@ -565,6 +609,198 @@ function normalizeContentType(contentType: string): string {
   return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(ct)
     ? ct
     : DEFAULT_DOC_CONTENT_TYPE
+}
+
+// Extensions we're happy to render in the in-browser text viewer. Uploaded
+// code/markdown often arrives as application/octet-stream (browsers don't
+// know the type), so extension is the reliable signal. Deliberately does NOT
+// include binary formats.
+const TEXT_EXTENSIONS = new Set([
+  'txt', 'text', 'log', 'csv', 'tsv', 'md', 'markdown', 'mdx',
+  'json', 'jsonc', 'json5', 'geojson', 'ndjson', 'xml', 'yaml', 'yml',
+  'toml', 'ini', 'cfg', 'conf', 'env', 'properties', 'editorconfig',
+  'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'mts', 'cts',
+  'py', 'pyw', 'pyi', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'scala',
+  'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hh', 'cs', 'php', 'swift',
+  'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd', 'lua', 'pl', 'pm', 'r',
+  'sql', 'html', 'htm', 'css', 'scss', 'sass', 'less', 'vue', 'svelte',
+  'diff', 'patch', 'tex', 'dart', 'ex', 'exs', 'graphql', 'gql', 'proto',
+  'dockerfile', 'makefile', 'gitignore', 'dockerignore', 'nim', 'zig', 'jl',
+])
+
+const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdx'])
+
+function fileExt(filename: string): string {
+  const base = filename.toLowerCase().split('/').pop() || ''
+  if (!base.includes('.')) return base // e.g. Dockerfile, Makefile
+  return base.slice(base.lastIndexOf('.') + 1)
+}
+
+function isViewableText(filename: string, contentType: string): boolean {
+  const ct = normalizeContentType(contentType)
+  if (ct.startsWith('text/') || ct === 'application/json' || ct === 'application/xml') return true
+  return TEXT_EXTENSIONS.has(fileExt(filename))
+}
+
+function htmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => (
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
+  ))
+}
+
+// Full-page text/markdown/code viewer. The raw bytes are fetched client-side
+// from `?raw=1` (same origin) so this shell can be cached and the content
+// stays a single source of truth. Markdown is rendered + sanitised; other
+// text is shown as syntax-highlighted <pre>. Libraries load from the same
+// CDNs the main app already uses.
+function viewerPage(id: string, filename: string, contentType: string): string {
+  const ext = fileExt(filename)
+  const isMd = MARKDOWN_EXTENSIONS.has(ext) || normalizeContentType(contentType) === 'text/markdown'
+  const isPdf = ext === 'pdf' || normalizeContentType(contentType) === 'application/pdf'
+  // Prose-like text (.txt/.text) and markdown open rendered by default; code and
+  // data files open as highlighted source. Either can be flipped with the toggle.
+  const defaultMode = isMd || ext === 'txt' || ext === 'text' ? 'md' : 'source'
+  const kind = isPdf ? 'pdf' : 'text'
+  const cfg = JSON.stringify({ filename, ext, defaultMode, kind }).replace(/</g, '\\u003c')
+  const title = htmlEscape(filename)
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>${title}</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/github-dark.min.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b0b0f; color: #e6e6ee;
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; gap: 12px; align-items: center;
+    padding: 12px 18px; background: #14141b; border-bottom: 1px solid #26263a; }
+  header .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-sans-serif, system-ui, sans-serif; }
+  header .spacer { flex: 1 1 auto; }
+  header a { color: #c9c9e0; text-decoration: none; font-size: 13px; padding: 6px 12px;
+    border: 1px solid #35354d; border-radius: 8px; background: #1c1c27;
+    font-family: ui-sans-serif, system-ui, sans-serif; white-space: nowrap; }
+  header a:hover { background: #262636; }
+  header a.home { border: none; background: none; color: #8b8bb0; padding: 6px 4px; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 18px 64px; }
+  pre { margin: 0; padding: 18px; background: #12121a; border: 1px solid #23233a; border-radius: 10px;
+    overflow-x: auto; font-size: 13px; }
+  pre code { background: none; padding: 0; }
+  .md { font-family: ui-sans-serif, system-ui, sans-serif; line-height: 1.7; }
+  .md h1, .md h2 { border-bottom: 1px solid #26263a; padding-bottom: .3em; }
+  .md h1, .md h2, .md h3, .md h4 { margin-top: 1.4em; }
+  .md code { background: #1c1c27; padding: .15em .4em; border-radius: 5px; font-size: .9em; }
+  .md pre { font-family: ui-monospace, monospace; }
+  .md pre code { background: none; }
+  .md a { color: #9a9aff; }
+  .md blockquote { margin: 1em 0; padding: 0 1em; border-left: 3px solid #35354d; color: #b3b3c9; }
+  .md table { border-collapse: collapse; } .md th, .md td { border: 1px solid #2a2a40; padding: 6px 10px; }
+  .md img { max-width: 100%; }
+  .pdf { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .pdf canvas { max-width: 100%; height: auto; border: 1px solid #23233a; border-radius: 6px;
+    background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.45); }
+  .loading { color: #7a7a99; padding: 24px 0; }
+</style>
+</head><body>
+<header>
+  <a class="home" href="/">&larr; docshare</a>
+  <span class="name" id="fname"></span>
+  <span class="spacer"></span>
+  <a href="#" id="toggle" role="button"></a>
+  <a href="?raw=1">Raw</a>
+  <a href="?dl=1">Download</a>
+</header>
+<main id="main"><div class="loading">Loading…</div></main>
+<script id="cfg" type="application/json">${cfg}</script>
+<script type="module">
+  const cfg = JSON.parse(document.getElementById('cfg').textContent)
+  document.getElementById('fname').textContent = cfg.filename
+  const main = document.getElementById('main')
+  const toggle = document.getElementById('toggle')
+  const esc = (s) => s.replace(/[&<>]/g, (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;')
+  let raw = null // string for text, ArrayBuffer for pdf
+  let mode = cfg.defaultMode // 'md' (rendered) | 'source' (highlighted)
+
+  async function renderMd(t) {
+    const [{ marked }, DOMPurify] = await Promise.all([
+      import('https://esm.sh/marked@12'),
+      import('https://esm.sh/dompurify@3').then((m) => m.default),
+    ])
+    const div = document.createElement('div')
+    div.className = 'md'
+    div.innerHTML = DOMPurify.sanitize(marked.parse(t, { breaks: true }))
+    return div
+  }
+  async function renderSource(t) {
+    const pre = document.createElement('pre')
+    const code = document.createElement('code')
+    code.textContent = t
+    pre.appendChild(code)
+    try {
+      const hljs = (await import('https://esm.sh/highlight.js@11.10.0/lib/common')).default
+      const lang = hljs.getLanguage(cfg.ext) ? cfg.ext : null
+      code.innerHTML = lang
+        ? hljs.highlight(t, { language: lang, ignoreIllegals: true }).value
+        : hljs.highlightAuto(t).value
+      code.classList.add('hljs')
+    } catch {}
+    return pre
+  }
+  async function renderPdf(buf) {
+    const pdfjs = await import('https://esm.sh/pdfjs-dist@4.7.76/build/pdf.min.mjs')
+    pdfjs.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.7.76/build/pdf.worker.min.mjs'
+    const doc = await pdfjs.getDocument({ data: buf }).promise
+    const wrap = document.createElement('div')
+    wrap.className = 'pdf'
+    const dpr = Math.min(2, window.devicePixelRatio || 1)
+    const cssW = Math.min(900, main.clientWidth || 900)
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i)
+      const base = page.getViewport({ scale: 1 })
+      const vp = page.getViewport({ scale: (cssW / base.width) * dpr })
+      const canvas = document.createElement('canvas')
+      canvas.width = vp.width
+      canvas.height = vp.height
+      canvas.style.width = (vp.width / dpr) + 'px'
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
+      wrap.appendChild(canvas)
+    }
+    return wrap
+  }
+  async function render() {
+    main.innerHTML = '<div class="loading">Loading…</div>'
+    try {
+      if (raw == null) {
+        const res = await fetch(location.pathname + '?raw=1')
+        if (!res.ok) throw new Error(res.status)
+        raw = cfg.kind === 'pdf' ? await res.arrayBuffer() : await res.text()
+      }
+      let el
+      if (cfg.kind === 'pdf') el = await renderPdf(raw.slice(0))
+      else el = mode === 'md' ? await renderMd(raw) : await renderSource(raw)
+      main.replaceChildren(el)
+    } catch (e) {
+      main.innerHTML = '<pre>Could not load file (' + esc(String(e && e.message || e)) + ')</pre>'
+    }
+  }
+  if (cfg.kind === 'pdf') {
+    toggle.style.display = 'none' // pdf has one view
+  } else {
+    const setLabel = () => { toggle.textContent = mode === 'md' ? 'Source' : 'Rendered' }
+    toggle.addEventListener('click', (e) => {
+      e.preventDefault()
+      mode = mode === 'md' ? 'source' : 'md'
+      setLabel()
+      render()
+    })
+    setLabel()
+  }
+  render()
+</script>
+</body></html>`
 }
 
 function parseSingleRange(rangeHeader: string): R2GetOptions['range'] | undefined {
@@ -612,11 +848,83 @@ app.get('/api/usage', async (c) => {
     storage: { used, cap: capBytes(c.env) },
     daily: {
       count: daily.count,
-      countMax: Number(c.env.DOC_DAILY_COUNT) || 5,
+      countMax: Number(c.env.DOC_DAILY_COUNT) || 10,
       bytes: daily.bytes,
       bytesMax: Number(c.env.DOC_DAILY_BYTES) || 1572864000,
     },
   })
+})
+
+// List uploads the caller can claim: everything with an uploaderTag matching
+// the caller's IP (so all devices sharing a public IP see the same list), or —
+// when the owner sends the admin password — every upload on the instance. Lets
+// a secondary device see and delete uploads it never had in local history.
+// Personal-scale instance: a bounded full-bucket scan is fine here.
+app.get('/api/mine', async (c) => {
+  const ip = clientIp(c.req.raw)
+  const admin = isAdmin(c)
+  const myTag = await hashIp(ip)
+  const ttlHours = Number(c.env.TTL_HOURS) || 24
+  const mine = (tag: unknown) => admin || (typeof tag === 'string' && tag === myTag)
+
+  const items: Array<Record<string, unknown>> = []
+  const SCAN_CAP = 5000 // safety bound on objects scanned per prefix
+
+  // Docs: metadata lives in meta/{id}.json; only surface finalized uploads.
+  let cursor: string | undefined
+  let scanned = 0
+  do {
+    const listed = await c.env.BUCKET.list({ prefix: 'meta/', cursor, limit: 1000 })
+    for (const obj of listed.objects) {
+      if (++scanned > SCAN_CAP) break
+      const id = obj.key.slice('meta/'.length).replace(/\.json$/, '')
+      if (!isValidId(id)) continue
+      const metaObj = await c.env.BUCKET.get(obj.key)
+      if (!metaObj) continue
+      const meta = await metaObj.json<DocMeta>().catch(() => undefined)
+      if (!meta || meta.finalized !== true) continue
+      if (!mine(meta.uploaderTag)) continue
+      const filename = meta.filename || id
+      items.push({
+        kind: 'doc', id, filename,
+        contentType: meta.contentType || 'application/octet-stream',
+        size: meta.size || 0,
+        uploadedAt: meta.uploadedAt || 0,
+        expiresAt: meta.expiresAt || 0,
+        url: `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`,
+      })
+    }
+    cursor = listed.truncated ? listed.cursor : undefined
+  } while (cursor && scanned <= SCAN_CAP)
+
+  // Images: uploaderTag lives in R2 customMetadata; skip OCR sidecar objects.
+  cursor = undefined
+  scanned = 0
+  do {
+    // include:['customMetadata'] is supported at runtime but missing from the
+    // pinned R2ListOptions types — cast to reach it.
+    const listed = await c.env.BUCKET.list({ prefix: 'img/', cursor, limit: 1000, include: ['customMetadata'] } as R2ListOptions)
+    for (const obj of listed.objects) {
+      if (++scanned > SCAN_CAP) break
+      if (!obj.key.endsWith('.webp')) continue
+      const id = obj.key.slice('img/'.length).replace(/\.webp$/, '')
+      const cm = obj.customMetadata || {}
+      if (!mine(cm.uploaderTag)) continue
+      const uploadedAt = Number(cm.uploadedAt) || 0
+      items.push({
+        kind: 'image', id,
+        contentType: 'image/webp',
+        size: obj.size || 0,
+        uploadedAt,
+        expiresAt: uploadedAt ? uploadedAt + ttlHours * 3600 * 1000 : 0,
+        url: `${c.env.PUBLIC_ORIGIN}/i/${id}.webp`,
+      })
+    }
+    cursor = listed.truncated ? listed.cursor : undefined
+  } while (cursor && scanned <= SCAN_CAP)
+
+  items.sort((a, b) => Number(b.uploadedAt) - Number(a.uploadedAt))
+  return c.json({ items, admin })
 })
 
 // Metadata for either an image (id) or a doc (id).
