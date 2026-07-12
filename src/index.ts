@@ -794,14 +794,14 @@ function viewerPage(id: string, filename: string, contentType: string): string {
   }
   function parseTable(t) {
     const rows = []; let row = []; let field = ''; let q = false
-    const s = t.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-    const sep = cfg.ext === 'tsv' ? '\t' : ','
+    const s = t.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n')
+    const sep = cfg.ext === 'tsv' ? '\\t' : ','
     for (let i = 0; i < s.length; i++) {
       const c = s[i]
       if (q) { if (c === '"') { if (s[i + 1] === '"') { field += '"'; i++ } else q = false } else field += c }
       else if (c === '"') q = true
       else if (c === sep) { row.push(field); field = '' }
-      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = '' }
+      else if (c === '\\n') { row.push(field); rows.push(row); row = []; field = '' }
       else field += c
     }
     if (field.length || row.length) { row.push(field); rows.push(row) }
@@ -829,11 +829,11 @@ function viewerPage(id: string, filename: string, contentType: string): string {
   function renderDiff(t) {
     const pre = document.createElement('pre')
     pre.className = 'diff'
-    for (const line of t.split('\n')) {
+    for (const line of t.split('\\n')) {
       const span = document.createElement('span')
       span.className = 'l'
       if (line.startsWith('@@')) span.classList.add('hunk')
-      else if (/^(\+\+\+|---|diff |index )/.test(line)) span.classList.add('meta')
+      else if (/^(\\+\\+\\+|---|diff |index )/.test(line)) span.classList.add('meta')
       else if (line[0] === '+') span.classList.add('add')
       else if (line[0] === '-') span.classList.add('del')
       span.textContent = line || ' '
