@@ -4,7 +4,7 @@
 > auto-delete after 24 hours. Public endpoint: https://docs.safzan.dev
 
 docshare is an open Cloudflare Worker that gives any agent a short-lived
-download URL for any file (≤300 MB) or any image (auto-converted to WebP, with
+download URL for any file (≤400 MB) or any image (auto-converted to WebP, with
 optional OCR via Gemini). Built for sharing build artifacts, screenshots, logs,
 and documents with coding agents.
 
@@ -21,7 +21,7 @@ streams the original file with the original filename.
 
 For files >100 MB, use the 3-step presigned flow (the Worker request body is
 capped at 100 MB on Cloudflare Free/Pro; direct-to-R2 presigned PUT bypasses
-that limit up to 300 MB).
+that limit up to 400 MB).
 
 ## Agent skill
 
@@ -48,8 +48,13 @@ the share URL. Works with Claude Code, opencode, and the other agents the
   directly to `putUrl` (a presigned R2 S3 URL), then POST to /api/doc/finalize.
 - [POST /api/doc/finalize](https://docs.safzan.dev/api/doc/finalize) — step 3.
   Body: `{id}`. Confirms the upload landed and enforces max size.
-- [GET /d/:id/:filename](https://docs.safzan.dev/d/) — download a doc. Always
-  served `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`.
+- [GET /d/:id/:filename](https://docs.safzan.dev/d/) — fetch a doc. Programmatic
+  clients (curl/agents, no `text/html` in `Accept`) get the raw bytes as a forced
+  download (`Content-Disposition: attachment` + `X-Content-Type-Options: nosniff`).
+  Browsers get a rendered viewer: Markdown and `.txt` rendered, code/data
+  syntax-highlighted (Rendered⇄Source toggle), PDFs previewed inline, media
+  played inline. `?raw=1` forces raw text/bytes; `?dl=1` forces a download.
+  Response sends `Vary: Accept`.
 - [GET /i/:id.webp](https://docs.safzan.dev/i/) — fetch an image.
 - [POST /api/ocr/:id](https://docs.safzan.dev/api/ocr/) — run OCR on an image
   (Gemini). Result cached server-side; second call on same image is free.
@@ -58,8 +63,8 @@ the share URL. Works with Claude Code, opencode, and the other agents the
 
 ## Limits
 
-- 300 MB max per doc; 15 MB max per image
-- 5 docs / 1.5 GB per IP per day (sustained); 2 doc uploads per 60 s (burst)
+- 400 MB max per doc; 15 MB max per image
+- 10 docs / 1.5 GB per IP per day (sustained); 2 doc uploads per 60 s (burst)
 - 6 image uploads per 60 s, 3 OCR calls per 60 s
 - All uploads auto-deleted after 24 h via R2 lifecycle rule
 

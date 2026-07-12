@@ -1,6 +1,6 @@
 ---
 name: docshare
-description: Upload a local file or image to a docshare instance (default https://docs.safzan.dev) and return a 24h-TTL download URL. Use when the user wants to share a local file with another LLM/agent, hand a build artifact / log / screenshot / document to a remote tool, or asks to "upload this", "give me a link to this file", "docshare it", "share this with the other agent". Files up to 300 MB are supported.
+description: Upload a local file or image to a docshare instance (default https://docs.safzan.dev) and return a 24h-TTL share URL. Use when the user wants to share a local file with another LLM/agent, hand a build artifact / log / screenshot / document to a remote tool, or asks to "upload this", "give me a link to this file", "docshare it", "share this with the other agent". Files up to 400 MB are supported. The share URL renders in a browser (markdown, code, PDF, images) and serves raw bytes to curl/agents.
 ---
 
 # docshare
@@ -20,7 +20,7 @@ everything after 24 hours.
 
 - The user wants a long-lived URL — docshare hard-deletes after 24 h
 - The file contains secrets you wouldn't put on a third-party host
-- The file is > 300 MB (docshare will reject it)
+- The file is > 400 MB (docshare will reject it)
 - The user already has their own hosting and didn't ask for docshare
 
 ## How to invoke
@@ -44,13 +44,35 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.p
 
 Detection rule of thumb: if you're in a Windows shell where `bash` isn't
 available, use `upload.ps1`; otherwise `upload.sh`. Both stream the file
-without loading it into memory (works fine up to the 300 MB max).
+without loading it into memory (works fine up to the 400 MB max).
 
 ## Reporting the result
 
 Reply with **just the URL on its own line** so the user (or the next tool) can
 copy it directly. Don't wrap it in markdown link syntax unless the user asked
 for a link. Mention the 24 h TTL only if the user seems unaware of it.
+
+## The share URL renders in a browser
+
+The returned `/d/:id/:filename` URL is dual-purpose, keyed off the `Accept`
+header (the response sends `Vary: Accept`):
+
+- **A browser** opening the URL gets a **rendered viewer** — Markdown (`.md`,
+  and `.txt`) rendered, code/data syntax-highlighted (with a Rendered ⇄ Source
+  toggle), PDFs previewed inline, images/video/audio played inline. Good for
+  handing a human a readable link.
+- **curl / an agent** (no `text/html` in `Accept`) always gets the **raw
+  bytes** as a forced download — so programmatic fetches are unaffected.
+
+Two query params override the default:
+
+- `?raw=1` — always return the raw text/bytes (git-raw style), never the
+  viewer. Use this when handing a text/markdown/code file to **another agent**
+  that should read the content, not the HTML shell.
+- `?dl=1` — always force a download, even in a browser.
+
+So: give a **human** the plain URL (nice preview); give **another agent** the
+URL with `?raw=1` if it needs to read file contents directly.
 
 ## Pointing at a different deployment
 
@@ -69,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.p
 
 ## What the script does under the hood
 
-Uses the 3-step presigned flow (works for the full 1 byte → 300 MB range):
+Uses the 3-step presigned flow (works for the full 1 byte → 400 MB range):
 
 1. `POST {endpoint}/api/doc/presign` with `{filename, size, contentType}` →
    gets back `{id, putUrl, downloadUrl}`
@@ -88,7 +110,7 @@ uniformly so the same code path handles every size.
 
 ## Limits on the public endpoint
 
-- 300 MB max per file
-- 5 uploads / 1.5 GB per IP per day (sustained)
+- 400 MB max per file
+- 10 uploads / 1.5 GB per IP per day (sustained)
 - 2 uploads per 60 s (burst)
 - 24 h TTL on all stored objects
