@@ -576,6 +576,7 @@ async function serveDoc(c: Context<{ Bindings: Bindings }>) {
   headers.set('x-content-type-options', 'nosniff')
   headers.set('cache-control', 'public, max-age=300, immutable')
   headers.set('vary', 'Accept') // same URL varies HTML-viewer vs raw bytes by Accept
+  headers.set('access-control-allow-origin', '*') // let pulp (and any tool) fetch the raw bytes
   if (inline) headers.set('accept-ranges', 'bytes')
   if (obj.httpEtag) headers.set('etag', obj.httpEtag)
 
@@ -655,12 +656,16 @@ function htmlEscape(s: string): string {
 // CDNs the main app already uses.
 function viewerPage(id: string, filename: string, contentType: string): string {
   const ext = fileExt(filename)
-  const isMd = MARKDOWN_EXTENSIONS.has(ext) || normalizeContentType(contentType) === 'text/markdown'
-  const isPdf = ext === 'pdf' || normalizeContentType(contentType) === 'application/pdf'
-  // Prose-like text (.txt/.text) and markdown open rendered by default; code and
-  // data files open as highlighted source. Either can be flipped with the toggle.
-  const defaultMode = isMd || ext === 'txt' || ext === 'text' ? 'md' : 'source'
-  const kind = isPdf ? 'pdf' : 'text'
+  const ct = normalizeContentType(contentType)
+  const isMd = MARKDOWN_EXTENSIONS.has(ext) || ct === 'text/markdown'
+  const isPdf = ext === 'pdf' || ct === 'application/pdf'
+  const isCsv = ext === 'csv' || ext === 'tsv' || ct === 'text/csv'
+  const isDiff = ext === 'diff' || ext === 'patch'
+  const kind = isPdf ? 'pdf' : isCsv ? 'csv' : isDiff ? 'diff' : 'text'
+  // csv → table, diff → colorized, markdown/.txt → rendered; code/data → source.
+  // The "rendered" view can always be flipped to raw source with the toggle.
+  const defaultMode =
+    kind === 'text' ? (isMd || ext === 'txt' || ext === 'text' ? 'rendered' : 'source') : 'rendered'
   const cfg = JSON.stringify({ filename, ext, defaultMode, kind }).replace(/</g, '\\u003c')
   const title = htmlEscape(filename)
   return `<!doctype html>
@@ -702,6 +707,22 @@ function viewerPage(id: string, filename: string, contentType: string): string {
   .pdf { display: flex; flex-direction: column; align-items: center; gap: 14px; }
   .pdf canvas { max-width: 100%; height: auto; border: 1px solid #23233a; border-radius: 6px;
     background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.45); }
+  table.csv { border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 12.5px; }
+  table.csv th, table.csv td { border: 1px solid #262638; padding: 5px 9px; text-align: left; white-space: pre; }
+  table.csv thead th { position: sticky; top: 49px; background: #171722; font-weight: 600; }
+  table.csv tbody tr:nth-child(2n) { background: #101018; }
+  .diff { padding: 14px 0; }
+  .diff .l { display: block; padding: 0 14px; white-space: pre-wrap; word-break: break-word; }
+  .diff .add { background: rgba(60,160,90,.16); color: #b7f0c6; }
+  .diff .del { background: rgba(200,70,70,.16); color: #f2b8b8; }
+  .diff .hunk { color: #7aa2ff; background: #14141f; }
+  .diff .meta { color: #8b8bb0; }
+  .menu { position: relative; }
+  .menu .items { position: absolute; right: 0; top: calc(100% + 6px); display: none; flex-direction: column;
+    background: #17171f; border: 1px solid #35354d; border-radius: 8px; overflow: hidden; min-width: 150px; z-index: 10; }
+  .menu.open .items { display: flex; }
+  .menu .items a { border: none; border-radius: 0; background: none; padding: 9px 14px; }
+  .menu .items a:hover { background: #262636; }
   .loading { color: #7a7a99; padding: 24px 0; }
 </style>
 </head><body>
@@ -709,6 +730,7 @@ function viewerPage(id: string, filename: string, contentType: string): string {
   <a class="home" href="/">&larr; docshare</a>
   <span class="name" id="fname"></span>
   <span class="spacer"></span>
+  <span id="pulp" class="menu" style="display:none"></span>
   <a href="#" id="toggle" role="button"></a>
   <a href="?raw=1">Raw</a>
   <a href="?dl=1">Download</a>
@@ -721,8 +743,8 @@ function viewerPage(id: string, filename: string, contentType: string): string {
   const main = document.getElementById('main')
   const toggle = document.getElementById('toggle')
   const esc = (s) => s.replace(/[&<>]/g, (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;')
-  let raw = null // string for text, ArrayBuffer for pdf
-  let mode = cfg.defaultMode // 'md' (rendered) | 'source' (highlighted)
+  let raw = null // string for text/csv/diff, ArrayBuffer for pdf
+  let mode = cfg.defaultMode // 'rendered' | 'source' (n/a for pdf)
 
   async function renderMd(t) {
     const [{ marked }, DOMPurify] = await Promise.all([
@@ -770,6 +792,60 @@ function viewerPage(id: string, filename: string, contentType: string): string {
     }
     return wrap
   }
+  function parseTable(t) {
+    const rows = []; let row = []; let field = ''; let q = false
+    const s = t.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    const sep = cfg.ext === 'tsv' ? '\t' : ','
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i]
+      if (q) { if (c === '"') { if (s[i + 1] === '"') { field += '"'; i++ } else q = false } else field += c }
+      else if (c === '"') q = true
+      else if (c === sep) { row.push(field); field = '' }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = '' }
+      else field += c
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row) }
+    return rows.filter((r) => r.some((x) => x !== ''))
+  }
+  function renderCsv(t) {
+    const rows = parseTable(t)
+    const table = document.createElement('table')
+    table.className = 'csv'
+    const cap = 2000
+    const body = document.createElement('tbody')
+    rows.slice(0, cap).forEach((r, i) => {
+      const tr = document.createElement('tr')
+      r.forEach((cell) => { const td = document.createElement(i === 0 ? 'th' : 'td'); td.textContent = cell; tr.appendChild(td) })
+      if (i === 0) { const head = document.createElement('thead'); head.appendChild(tr); table.appendChild(head) }
+      else body.appendChild(tr)
+    })
+    table.appendChild(body)
+    const wrap = document.createElement('div')
+    wrap.style.overflowX = 'auto'
+    wrap.appendChild(table)
+    if (rows.length > cap) { const n = document.createElement('p'); n.className = 'loading'; n.textContent = 'showing first ' + cap + ' of ' + rows.length + ' rows'; wrap.appendChild(n) }
+    return wrap
+  }
+  function renderDiff(t) {
+    const pre = document.createElement('pre')
+    pre.className = 'diff'
+    for (const line of t.split('\n')) {
+      const span = document.createElement('span')
+      span.className = 'l'
+      if (line.startsWith('@@')) span.classList.add('hunk')
+      else if (/^(\+\+\+|---|diff |index )/.test(line)) span.classList.add('meta')
+      else if (line[0] === '+') span.classList.add('add')
+      else if (line[0] === '-') span.classList.add('del')
+      span.textContent = line || ' '
+      pre.appendChild(span)
+    }
+    return pre
+  }
+  async function renderRendered(t) {
+    if (cfg.kind === 'csv') return renderCsv(t)
+    if (cfg.kind === 'diff') return renderDiff(t)
+    return renderMd(t)
+  }
   async function render() {
     main.innerHTML = '<div class="loading">Loading…</div>'
     try {
@@ -780,24 +856,58 @@ function viewerPage(id: string, filename: string, contentType: string): string {
       }
       let el
       if (cfg.kind === 'pdf') el = await renderPdf(raw.slice(0))
-      else el = mode === 'md' ? await renderMd(raw) : await renderSource(raw)
+      else el = mode === 'source' ? await renderSource(raw) : await renderRendered(raw)
       main.replaceChildren(el)
     } catch (e) {
       main.innerHTML = '<pre>Could not load file (' + esc(String(e && e.message || e)) + ')</pre>'
     }
   }
+  // rendered ⇄ source toggle (hidden for pdf, which has one view)
   if (cfg.kind === 'pdf') {
-    toggle.style.display = 'none' // pdf has one view
+    toggle.style.display = 'none'
   } else {
-    const setLabel = () => { toggle.textContent = mode === 'md' ? 'Source' : 'Rendered' }
+    const renderedLabel = cfg.kind === 'csv' ? 'Table' : cfg.kind === 'diff' ? 'Diff' : 'Rendered'
+    const setLabel = () => { toggle.textContent = mode === 'source' ? renderedLabel : 'Source' }
     toggle.addEventListener('click', (e) => {
       e.preventDefault()
-      mode = mode === 'md' ? 'source' : 'md'
+      mode = mode === 'source' ? 'rendered' : 'source'
       setLabel()
       render()
     })
     setLabel()
   }
+
+  // "Open in pulp" — deep-link this file into a matching pulp tool (pulp fetches
+  // the raw bytes via ?src=; /d/ sends Access-Control-Allow-Origin so it can).
+  const PULP_TOOLS = {
+    pdf: [['organize', 'Organize'], ['compress', 'Compress'], ['edit-text', 'Edit text'], ['split', 'Split']],
+    csv: [['csv-to-pdf', 'CSV → PDF']],
+    tsv: [['csv-to-pdf', 'CSV → PDF']],
+  }
+  const targets = PULP_TOOLS[cfg.ext]
+  if (targets) {
+    const rawUrl = location.origin + location.pathname + '?raw=1'
+    const menu = document.getElementById('pulp')
+    menu.style.display = ''
+    const btn = document.createElement('a')
+    btn.href = '#'
+    btn.textContent = 'Open in pulp ▾'
+    const items = document.createElement('div')
+    items.className = 'items'
+    for (const [slug, label] of targets) {
+      const a = document.createElement('a')
+      a.href = 'https://pulp.subintern.com/' + slug + '?src=' + encodeURIComponent(rawUrl)
+      a.target = '_blank'
+      a.rel = 'noopener'
+      a.textContent = label
+      items.appendChild(a)
+    }
+    menu.appendChild(btn)
+    menu.appendChild(items)
+    btn.addEventListener('click', (e) => { e.preventDefault(); menu.classList.toggle('open') })
+    document.addEventListener('click', (e) => { if (!menu.contains(e.target)) menu.classList.remove('open') })
+  }
+
   render()
 </script>
 </body></html>`
