@@ -12,6 +12,7 @@ import { runOcr } from './ocr'
 import { presignPutUrl } from './presign'
 import { checkAndChargeDaily, hashIp, readDailyUsage, refundChargedDaily, refundDaily } from './ratelimit'
 import { addStorageUsed, getStorageUsed, reconcileStorage, withinStorageCap } from './storage'
+import { contentTypeForDownload } from './download-content-type'
 
 // Hard ceiling on the simple PUT /upload/:filename route. CF Workers cap the
 // request body at 100MB on Free/Pro. For files larger than this, clients must
@@ -527,6 +528,7 @@ async function serveDoc(c: Context<{ Bindings: Bindings }>) {
     if (meta.filename) filename = sanitizeFilename(meta.filename)
     if (meta.contentType) contentType = normalizeContentType(meta.contentType)
   }
+  contentType = contentTypeForDownload(filename, contentType)
 
   // Text/code/markdown files get a styled full-page viewer when opened in a
   // browser (Accept: text/html). `?raw=1` serves the plain text (git-raw
