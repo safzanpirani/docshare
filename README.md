@@ -118,6 +118,28 @@ npm run deploy
 The `docs.safzan.dev` custom-domain bind needs the `safzan.dev` zone on this
 Cloudflare account (it already serves `share.safzan.dev`).
 
+## Maintenance
+
+Run the complete verification sequence after a dependency update:
+
+```sh
+npm ci
+npm run check
+npm audit
+npm audit --omit=dev
+dry_run_dir="$(mktemp -d)"
+npx wrangler deploy --dry-run --outdir "$dry_run_dir"
+```
+
+Upgrade Wrangler and `@cloudflare/workers-types` together. Wrangler declares
+the types package as an optional peer dependency. Resolve peer-version conflicts
+in `package.json` and the lockfile. Do not bypass them with `--force` or
+`--legacy-peer-deps`.
+
+After deployment, verify the homepage and a representative download against the
+live domain. Treat dependency audits, deployment output, and live checks as
+separate evidence.
+
 ## Local development
 ```sh
 cat > .dev.vars <<'EOF'
@@ -142,6 +164,10 @@ bucket + token + CORS must exist for doc uploads to work locally.
 | `POST /api/doc/finalize` | body `{ id }` — confirms upload, enforces max size |
 | `GET /d/:id/:filename` | streams a doc as a forced download |
 | `GET /api/info/:id` | metadata for an image or doc |
+
+APK downloads use `application/vnd.android.package-archive`. All document
+downloads retain `Content-Disposition: attachment` and
+`X-Content-Type-Options: nosniff`.
 
 ## Tunables (`wrangler.toml` `[vars]`)
 
