@@ -1,116 +1,142 @@
 ---
 name: docshare
-description: Upload a local file or image to a docshare instance (default https://docs.safzan.dev) and return a 24h-TTL share URL. Use when the user wants to share a local file with another LLM/agent, hand a build artifact / log / screenshot / document to a remote tool, or asks to "upload this", "give me a link to this file", "docshare it", "share this with the other agent". Files up to 400 MB are supported. The share URL renders in a browser (markdown, code, PDF, images) and serves raw bytes to curl/agents.
+description: Upload local files, piped output, or images to a docshare instance (default https://docs.safzan.dev) and get a 24h share URL, then list, delete, or make room among your own uploads. Use when the user wants to share a local file with another LLM/agent, hand a build artifact / log / screenshot / document to a remote tool, or says "upload this", "give me a link to this file", "docshare it", "share this with the other agent". Also use when a docshare upload fails on a daily or storage limit, or the user wants to see or delete what they uploaded. Files up to 400 MB. The URL renders in a browser (markdown, code, PDF, media) and serves raw bytes to curl/agents.
 ---
 
 # docshare
 
-Upload a local file or image and get back a short download URL that any LLM or
-agent can fetch. The default endpoint (https://docs.safzan.dev) auto-deletes
-everything after 24 hours.
+Upload a file and get back a short URL that any person, LLM, or agent can
+fetch. Everything auto-deletes after 24 hours.
 
-## When to use this skill
+## Commands
 
-- The user asks to share a local file with another AI/LLM/agent
-- The user says "upload this", "share this", "docshare it", "give me a link", "send this to <other tool>"
-- You produced a build artifact, log file, screenshot, or document and need a fetchable URL for it
-- You need to hand a file to a tool that takes URLs but not file uploads
-
-## When NOT to use
-
-- The user wants a long-lived URL — docshare hard-deletes after 24 h
-- The file contains secrets you wouldn't put on a third-party host
-- The file is > 400 MB (docshare will reject it)
-- The user already has their own hosting and didn't ask for docshare
-
-## How to invoke
-
-Two equivalent scripts live next to this SKILL.md. **Pick the one for the OS
-you're running on** — they take the same arg and produce the same output
-(download URL on stdout, error on stderr, non-zero exit on failure):
-
-- **macOS / Linux / WSL / git-bash:** `upload.sh` — pure bash + curl
-- **Windows (native PowerShell):** `upload.ps1` — pure PowerShell, no curl
+On this Mac, `docshare` is on PATH. Elsewhere, run the script next to this
+file: `upload.sh` (macOS, Linux, WSL, git-bash) or `upload.ps1` (native
+Windows PowerShell). Both take the same commands.
 
 ```bash
-# macOS / Linux / WSL / git-bash
-~/.claude/skills/docshare/upload.sh /path/to/file
+docshare report.pdf                 # prints the share URL
+docshare a.log b.log c.png          # one URL per line, in order
+some-cmd 2>&1 | docshare - -n build.log   # upload piped output
+docshare --raw notes.md             # URL with ?raw=1, for another agent to read
+docshare --json dist.zip            # {"id","url","rawUrl","filename","size","expiresAt"}
+docshare --make-room big.zip        # if a limit blocks it, delete your oldest uploads first
+
+docshare ls                         # your uploads: id, size, time left, name, URL
+docshare rm <url-or-id>...          # delete specific uploads
+docshare rm --all                   # delete every upload made with your token
+docshare usage                      # today's quota and service storage
+docshare make-room 50000000 --dry-run   # what would be deleted to fit 50 MB
 ```
 
 ```powershell
-# Windows PowerShell (5.1 ships with Windows; or pwsh 7+)
-powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.ps1" "C:\path\to\file"
+powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.ps1" C:\path\to\file
+# same subcommands: ls, rm, usage, make-room; switches: -Raw -Json -MakeRoom -Quiet -All -DryRun
+# piped input: use -Stdin -Name build.log (Windows PowerShell 5.1 rejects a bare '-')
 ```
 
-Detection rule of thumb: if you're in a Windows shell where `bash` isn't
-available, use `upload.ps1`; otherwise `upload.sh`. Both stream the file
-without loading it into memory (works fine up to the 400 MB max).
+Stdout carries only results (URLs or JSON). Progress and errors go to stderr.
 
-## Reporting the result
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | success | |
+| 2 | network or server error | read the stderr line; retry once |
+| 3 | a daily/storage cap or rate limit refused it | see "When an upload is refused" |
+| 64 | bad arguments | check `--help` |
+| 66 | file not found | fix the path |
 
-Reply with **just the URL on its own line** so the user (or the next tool) can
-copy it directly. Don't wrap it in markdown link syntax unless the user asked
-for a link. Mention the 24 h TTL only if the user seems unaware of it.
+## Which URL to hand over
 
-## The share URL renders in a browser
+- **A human** gets the plain URL. In a browser it renders Markdown and `.txt`,
+  syntax-highlights code, previews PDFs, and plays images, video, and audio.
+- **Another agent that should read the contents** gets the `--raw` URL
+  (`?raw=1`), so it receives the text instead of the HTML viewer.
+- **A binary download**: append `?dl=1` to force a download in browsers.
+  `.apk` files are served as `application/vnd.android.package-archive`, so
+  Android installs them.
 
-The returned `/d/:id/:filename` URL is dual-purpose, keyed off the `Accept`
-header (the response sends `Vary: Accept`):
+curl and agents fetching the plain URL (no `text/html` in `Accept`) always get
+raw bytes, so the plain URL also works for programmatic fetches.
 
-- **A browser** opening the URL gets a **rendered viewer** — Markdown (`.md`,
-  and `.txt`) rendered, code/data syntax-highlighted (with a Rendered ⇄ Source
-  toggle), PDFs previewed inline, images/video/audio played inline. Good for
-  handing a human a readable link.
-- **curl / an agent** (no `text/html` in `Accept`) always gets the **raw
-  bytes** as a forced download — so programmatic fetches are unaffected.
+Reply with **just the URL on its own line** so it can be copied. Mention the
+24 h expiry only if the user seems unaware of it.
 
-Two query params override the default:
+## When an upload is refused (exit 3)
 
-- `?raw=1` — always return the raw text/bytes (git-raw style), never the
-  viewer. Use this when handing a text/markdown/code file to **another agent**
-  that should read the content, not the HTML shell.
-- `?dl=1` — always force a download, even in a browser.
+The stderr line names the limit, and the numbers behind it:
 
-So: give a **human** the plain URL (nice preview); give **another agent** the
-URL with `?raw=1` if it needs to read file contents directly.
+- `daily_count` / `daily_bytes`: the per-IP daily cap (10 uploads, 1.5 GB).
+  It resets at 00:00 UTC.
+- `storage_full`: the service-wide storage cap.
+- `rate_limited`: the burst limit of 2 uploads per minute. The script
+  already waits it out and retries, so this rarely surfaces.
 
-## Pointing at a different deployment
+To get past a cap, delete your own older uploads:
 
-If the user has their own docshare worker, set `DOCSHARE_ENDPOINT`:
+1. `docshare make-room <bytes> --dry-run` shows what would go. Pass the size
+   of the file you want to upload.
+2. If the user is fine losing those, rerun the upload with `--make-room`. It
+   deletes the oldest uploads that free enough space and reports them on stderr.
+   Or pick files yourself with `docshare ls` and `docshare rm`.
+
+Deleting a file uploaded today from the same network refunds that day's quota.
+Make-room considers only uploads made with this machine's owner token. When
+those are not enough, it deletes nothing and says so (`cannot_make_room`).
+
+Deleting is irreversible. Before `--make-room`, `rm --all`, or `rm` on files
+you did not upload in this session, confirm with the user, unless they
+already told you to free space.
+
+## Ownership
+
+The script creates an owner token once in `~/.config/docshare/owner-token`
+(mode 600) and sends it with every request. The server stores only its hash.
+The token is what lets `ls`, `rm --all`, and `make-room` find your uploads
+later. Keep it private. `DOCSHARE_OWNER_TOKEN` overrides it.
+
+`ls` also shows untagged uploads from the same public IP, marked
+`(same IP, not your token)`. Those may belong to someone else on the network,
+or to the user from the web UI or a plain `curl`. `rm --all` and make-room
+skip them. Delete one only by explicit id, and only when you know whose it is.
+
+## Sending a file to Safzan on Telegram
+
+docshare is the **fallback** for that, not the default. Telegram's bot upload
+limit is 50 MB:
+
+- **Under 50 MB**: send the file itself with `tg file <path> -d -c "<caption>"`.
+  It arrives as a document he can open directly.
+- **Over 50 MB**: upload here, then send the URL with `tg send`. Say why it is
+  a link and that it expires in 24 h.
+
+## When not to use
+
+- The user wants a long-lived URL. Uploads are deleted after 24 h.
+- The file contains secrets you wouldn't put on a third-party host.
+- The file is over 400 MB.
+- The user already has their own hosting and didn't ask for docshare.
+
+## Other deployments and the admin key
+
+- `DOCSHARE_ENDPOINT=https://your.example docshare file` targets another
+  docshare deployment.
+- `DOCSHARE_ADMIN_KEY` (instance owner only) raises the per-file cap to
+  1.46 GB and skips the daily cap. The script sends it in a header file, never
+  in argv.
+
+## Raw API (no script)
+
+The full API reference is at <https://docs.safzan.dev/llms.txt>. The shortest
+forms:
 
 ```bash
-# macOS / Linux
-DOCSHARE_ENDPOINT=https://your.example ~/.claude/skills/docshare/upload.sh /path/to/file
+T=$(cat ~/.config/docshare/owner-token)
+curl -sT file.txt -H "x-owner-token: $T" -H 'accept: application/json' \
+  https://docs.safzan.dev/upload/file.txt           # ≤100 MB; JSON with id/url/rawUrl
+curl -s -X DELETE -H "x-owner-token: $T" <share URL>  # delete
+curl -s -H "x-owner-token: $T" https://docs.safzan.dev/api/mine   # list
 ```
 
-```powershell
-# Windows PowerShell
-$env:DOCSHARE_ENDPOINT = 'https://your.example'
-powershell -ExecutionPolicy Bypass -File "$HOME\.claude\skills\docshare\upload.ps1" "C:\path\to\file"
-```
-
-## What the script does under the hood
-
-Uses the 3-step presigned flow (works for the full 1 byte → 400 MB range):
-
-1. `POST {endpoint}/api/doc/presign` with `{filename, size, contentType}` →
-   gets back `{id, putUrl, downloadUrl}`
-2. `PUT` the raw file bytes to `putUrl` (which is a short-lived presigned R2
-   S3 URL — the bytes go straight to R2, not through the Worker)
-3. `POST {endpoint}/api/doc/finalize` with `{id}` to confirm + enforce size
-
-For files ≤ 100 MB, a single-curl alternative also exists:
-
-```bash
-curl -T file.pdf {endpoint}/upload/file.pdf
-```
-
-Response body is the download URL. The script uses the presigned flow
-uniformly so the same code path handles every size.
-
-## Limits on the public endpoint
-
-- 400 MB max per file
-- 10 uploads / 1.5 GB per IP per day (sustained)
-- 2 uploads per 60 s (burst)
-- 24 h TTL on all stored objects
+Files over 100 MB use the three-step presigned flow
+(`/api/doc/presign` → PUT to R2 → `/api/doc/finalize`). The script always
+uses that flow. Errors are JSON `{"error": "<code>", "hint": "..."}`.

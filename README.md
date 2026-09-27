@@ -41,7 +41,10 @@ That drops `skills/docshare/` into your agent's skills directory
 (`~/.claude/skills/docshare/` for Claude Code,
 `~/.config/opencode/skills/docshare/` for opencode). The agent can then call
 `~/.claude/skills/docshare/upload.sh <file>` to upload anything up to
-400 MB and get back a download URL.
+400 MB and get back a download URL. The same script lists (`ls`), deletes
+(`rm`), and frees space (`make-room`, or `--make-room` on an upload) among the
+uploads made with its owner token, prints JSON with `--json`, and uploads piped
+input with `-`. `upload.ps1` is the native Windows PowerShell equivalent.
 
 To point the skill at a self-hosted deployment:
 
