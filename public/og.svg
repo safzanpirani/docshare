@@ -37,7 +37,7 @@
         font-size="24" font-weight="500" fill="#8d87a0">docs.safzan.dev</text>
   <text x="80" y="540"
         font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
-        font-size="20" font-weight="400" fill="#565070">paste · drop · pick · 300 MB · 24h auto-delete</text>
+        font-size="20" font-weight="400" fill="#565070">paste · drop · pick · 400 MB · 24h auto-delete</text>
 
   <!-- decorative file stack -->
   <g transform="translate(820,180)" opacity="0.85">

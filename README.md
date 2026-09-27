@@ -3,9 +3,11 @@
 seeshare + temporary file hosting, in one Worker. Paste / drop / pick anything →
 short URL → auto-deletes in 24h. Built for handing files to coding agents.
 
-- **Images** are converted to WebP in the browser and posted through the Worker
-  (small payloads), with optional Gemini OCR — exactly like `seeshare`.
-- **Any other file** (≤ 300 MB) is uploaded **straight to R2 via a presigned PUT
+- **Images** are re-encoded in the browser and posted through the Worker (small
+  payloads), with optional Gemini OCR — exactly like `seeshare`. Output format is
+  selectable: **WEBP** (default, lossy, small) or **PNG** (lossless, larger).
+  See the PNG note under Known limitations.
+- **Any other file** (≤ 400 MB) is uploaded **straight to R2 via a presigned PUT
   URL** (the bytes never pass through the Worker) and served back as a forced
   download, so an LLM/agent can `curl` it.
 
@@ -20,7 +22,7 @@ Upload any file ≤ 100 MB in one curl — response body is the download URL:
 curl -T myfile.pdf https://docs.safzan.dev/upload/myfile.pdf
 ```
 
-For files up to 300 MB, use the 3-step presigned flow (`/api/doc/presign` →
+For files up to 400 MB, use the 3-step presigned flow (`/api/doc/presign` →
 PUT to R2 → `/api/doc/finalize`) — the skill below does this for you.
 
 LLMs/agents can read the API spec at <https://docs.safzan.dev/llms.txt>
@@ -39,7 +41,7 @@ That drops `skills/docshare/` into your agent's skills directory
 (`~/.claude/skills/docshare/` for Claude Code,
 `~/.config/opencode/skills/docshare/` for opencode). The agent can then call
 `~/.claude/skills/docshare/upload.sh <file>` to upload anything up to
-300 MB and get back a download URL.
+400 MB and get back a download URL.
 
 To point the skill at a self-hosted deployment:
 
@@ -55,14 +57,14 @@ export DOCSHARE_ENDPOINT=https://your.docshare.example
 
 - **Runtime:** single Cloudflare Worker (Hono)
 - **Storage:** one R2 bucket `docshare`
-  - `img/{id}.webp` — images, `img/{id}.ocr.json` — OCR sidecars
+  - `img/{id}.{webp,png}` — images, `img/{id}.ocr.json` — OCR sidecars
   - `doc/{id}` — uploaded files (16-char id), `meta/{id}.json` — filename/type/size
 - **TTL:** R2 lifecycle rule deletes objects > 1 day old (see setup)
 - **Large uploads:** presigned S3 PUT direct to R2, bypassing the Worker's
-  ~300 MB request-body limit. Requires an R2 S3-API token.
+  ~100 MB request-body limit. Requires an R2 S3-API token.
 - **Abuse control:**
   - burst: Cloudflare rate-limit bindings (images 6/60s, docs 2/60s, OCR 3/60s)
-  - sustained: KV per-IP daily caps (default 5 docs/day, 300 MB/day) — `src/ratelimit.ts`
+  - sustained: KV per-IP daily caps (deployed: 10 docs/day, 1.5 GB/day) — `src/ratelimit.ts`
 - **Security:** docs are always served `Content-Disposition: attachment` +
   `X-Content-Type-Options: nosniff` so a malicious `.html`/`.svg` can't run on
   this origin.
@@ -157,13 +159,31 @@ bucket + token + CORS must exist for doc uploads to work locally.
 | Route | What |
 |---|---|
 | `GET /` | the upload page |
-| `POST /api/upload` | image: `image/webp` bytes (≤ 15 MB). Returns `{ id, url, ... }` |
-| `GET /i/:id.webp` | streams an image |
+| `POST /api/upload` | image: `image/webp` or `image/png` bytes (≤ 15 MB). Returns `{ id, url, format, ... }` |
+| `GET /i/:id.{webp,png}` | streams an image |
 | `POST /api/ocr/:id` | OCR an image (cached); `ocr_disabled` if no Gemini key |
 | `POST /api/doc/presign` | body `{ filename, size, contentType }` → `{ id, putUrl, downloadUrl, ... }` |
 | `POST /api/doc/finalize` | body `{ id }` — confirms upload, enforces max size |
 | `GET /d/:id/:filename` | streams a doc as a forced download |
 | `GET /api/info/:id` | metadata for an image or doc |
+| `GET /api/mine` | uploads the caller can claim — see Ownership below |
+| `POST /api/delete` | body `{ id }` — deletes; the id is the capability |
+| `GET /api/usage` | caller's daily quota + the shared storage cap |
+
+### Ownership (`/api/mine`)
+
+Uploads are attributed by an **owner token**: an opaque secret the client mints
+once and sends as `x-owner-token` on every upload. The server stores only its
+SHA-256, and `/api/mine` returns the uploads whose stored hash matches. Clients
+that send no token (curl, agents) fall back to being matched by IP hash.
+
+The token exists because IP alone is not an identity: behind CGNAT, a corporate
+NAT, or a mobile carrier, unrelated people share a public IP and would otherwise
+see — and be able to delete — each other's uploads.
+
+`/api/mine` and `/api/delete` additionally reject browser requests carrying a
+cross-origin `Origin` header, so a page a user happens to visit cannot enumerate
+their uploads. Requests with no `Origin` (curl, agents) are unaffected.
 
 APK downloads use `application/vnd.android.package-archive`. All document
 downloads retain `Content-Disposition: attachment` and
@@ -171,13 +191,31 @@ downloads retain `Content-Disposition: attachment` and
 
 ## Tunables (`wrangler.toml` `[vars]`)
 
+Defaults below are the fallbacks in `src/config.ts`, used when the var is unset.
+The values actually deployed live in `wrangler.toml`.
+
 | Var | Default | What |
 |---|---|---|
 | `TTL_HOURS` | `24` | "expires at" shown to clients. **Actual delete is the R2 lifecycle rule** — keep in sync. |
-| `MAX_UPLOAD_BYTES` | 15 MB | image (webp) cap |
-| `MAX_DOC_BYTES` | 300 MB | doc cap |
-| `DOC_DAILY_COUNT` | `5` | docs per IP per day |
+| `MAX_UPLOAD_BYTES` | 15 MB | image cap, per encoded image (see PNG note below) |
+| `MAX_DOC_BYTES` | 100 MB | doc cap (deployed: 400 MB) |
+| `MAX_ADMIN_DOC_BYTES` | 1.46 GB | doc cap for requests carrying the admin key |
+| `DOC_DAILY_COUNT` | `10` | docs per IP per day |
 | `DOC_DAILY_BYTES` | 1.5 GB | doc bytes per IP per day |
+| `MAX_TOTAL_BYTES` | 9 GB | global storage hard cap (R2 free tier is 10 GB) |
+
+## Tests
+
+```sh
+npm run typecheck   # tsc --noEmit
+npm test            # vitest — pure logic: quotas, storage counter, headers, ids
+npm run check       # both; this is what CI runs
+```
+
+The suite covers the accounting logic (daily quota charge/refund, the global
+storage counter and its cron reconciliation), the header/filename/range helpers,
+and ownership matching. It uses in-memory KV/R2 fakes (`test/fakes.ts`) — no
+Workers runtime and no network, so it runs in well under a second.
 
 ## Known limitations
 
@@ -187,3 +225,12 @@ downloads retain `Content-Disposition: attachment` and
   came in over `MAX_DOC_BYTES`.
 - A client that presigns but never PUTs still consumes one count/declared-bytes
   for the day. The TTL lifecycle rule bounds any orphaned storage.
+- **PNG output and the 15 MB image cap.** `MAX_UPLOAD_BYTES` was sized for lossy
+  WebP. PNG is lossless, so there is no quality knob to walk down: the encoder
+  is single-shot and a large screenshot can exceed the cap outright, failing
+  with "switch to WEBP" rather than degrading. Raising the cap for PNG only, or
+  reducing `MAX_DIMENSION` for PNG, would both work — neither is implemented.
+- **Quotas are format-blind.** The per-IP daily byte cap and the 9 GB global cap
+  count bytes without regard to format, and PNG is several times larger per
+  image than WebP. Sustained PNG use burns quota much faster than the limits
+  were tuned for.

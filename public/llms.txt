@@ -40,7 +40,7 @@ the share URL. Works with Claude Code, opencode, and the other agents the
 - [PUT /upload/:filename](https://docs.safzan.dev/upload/) — simple one-shot
   upload, ≤100 MB. Body: raw file bytes. Response: plain-text download URL.
 - [POST /api/upload](https://docs.safzan.dev/api/upload) — image upload, body
-  must be `image/webp` bytes (≤15 MB). Returns JSON `{id, url, uploadedAt,
+  must be `image/webp` or `image/png` bytes (≤15 MB). Returns JSON `{id, url, format, uploadedAt,
   expiresAt, size}`.
 - [POST /api/doc/presign](https://docs.safzan.dev/api/doc/presign) — step 1 of
   3 for large docs. Body: `{filename, size, contentType}`. Returns `{id,
@@ -55,15 +55,22 @@ the share URL. Works with Claude Code, opencode, and the other agents the
   syntax-highlighted (Rendered⇄Source toggle), PDFs previewed inline, media
   played inline. `?raw=1` forces raw text/bytes; `?dl=1` forces a download.
   Response sends `Vary: Accept`.
-- [GET /i/:id.webp](https://docs.safzan.dev/i/) — fetch an image.
+- [GET /i/:id.webp](https://docs.safzan.dev/i/) — fetch an image (`.webp` or `.png`).
 - [POST /api/ocr/:id](https://docs.safzan.dev/api/ocr/) — run OCR on an image
   (Gemini). Result cached server-side; second call on same image is free.
 - [GET /api/info/:id](https://docs.safzan.dev/api/info/) — metadata for either
   an image or a doc.
+- [POST /api/delete](https://docs.safzan.dev/api/delete) — delete by `{id}`.
+  The id is the capability: anyone holding it can delete the file.
+- GET /api/mine — list uploads you can claim. Ownership is proved by the
+  `x-owner-token` header (any opaque 16–128 char `[A-Za-z0-9_-]` secret you
+  mint and reuse); uploads made while sending it are listed back to you. Sent
+  no token? You get the uploads made from your IP that carry no owner token.
+  Browsers may only call this (and /api/delete) from the app's own origin.
 
 ## Limits
 
-- 400 MB max per doc; 15 MB max per image
+- 400 MB max per doc (1.46 GB with the admin key); 15 MB max per image
 - 10 docs / 1.5 GB per IP per day (sustained); 2 doc uploads per 60 s (burst)
 - 6 image uploads per 60 s, 3 OCR calls per 60 s
 - All uploads auto-deleted after 24 h via R2 lifecycle rule

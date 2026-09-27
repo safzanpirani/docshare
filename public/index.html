@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>docshare · share files, images & video with coding agents</title>
-<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤300MB) gets a short download URL with inline preview for video/audio. Auto-deletes in 24h." />
+<meta name="description" content="Paste, drop, or pick anything. Images become WebP; any other file (≤400MB) gets a short download URL with inline preview for video/audio. Auto-deletes in 24h." />
 <meta name="color-scheme" content="dark" />
 <meta name="theme-color" content="#a78bfa" />
 <link rel="manifest" href="/manifest.webmanifest" />
@@ -16,7 +16,7 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="docshare" />
 <meta property="og:title" content="docshare · share files, images & video with coding agents" />
-<meta property="og:description" content="Paste, drop, or pick anything (≤300 MB). Inline previews for video & audio. Short URL, auto-deletes in 24h." />
+<meta property="og:description" content="Paste, drop, or pick anything (≤400 MB). Inline previews for video & audio. Short URL, auto-deletes in 24h." />
 <meta property="og:url" content="https://docs.safzan.dev/" />
 <meta property="og:image" content="https://docs.safzan.dev/og.png" />
 <meta property="og:image:width" content="1200" />
@@ -98,6 +98,21 @@
     border-radius: 3px; font-size: 11px; color: var(--text); background: #221d33; margin: 0 2px;
   }
   .drop-sub { color: var(--text-dim); font-size: 12px; margin-top: 14px; font-family: var(--mono); }
+  /* Image output format toggle. Lives inside the drop zone, which is itself a
+     click-to-browse target — the handlers stopPropagation so picking a format
+     doesn't also open the file dialog. */
+  .format-seg {
+    display: inline-flex; align-items: center; gap: 6px; margin-top: 12px;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .format-seg .format-label { color: var(--text-dim); margin-right: 2px; }
+  .format-seg button {
+    padding: 3px 10px; border: 1px solid var(--border-strong); background: #221d33;
+    color: var(--text-dim); border-radius: 4px; cursor: pointer; font: inherit;
+    transition: color .12s, background .12s, border-color .12s;
+  }
+  .format-seg button:hover { color: var(--text); }
+  .format-seg button.active { color: var(--accent); border-color: var(--accent); background: #2a2140; }
   .drop-status { margin-top: 16px; color: var(--accent); font-size: 12px; min-height: 1em; font-family: var(--mono); }
   .drop-status.error { color: var(--danger); }
   .progress {
@@ -285,7 +300,12 @@
     <div class="drop-title">
       <span class="kbd">⌘V</span> / <span class="kbd">Ctrl+V</span> to paste · drag &amp; drop · or click to browse
     </div>
-    <div class="drop-sub">images → WebP · any file ≤ 300 MB · 24h TTL · sent straight to storage</div>
+    <div class="drop-sub" id="drop-sub">images → WebP · any file ≤ 400 MB (1.46 GB unlocked) · 24h TTL · sent straight to storage</div>
+    <div class="format-seg" id="format-seg" role="group" aria-label="Image output format">
+      <span class="format-label">images →</span>
+      <button type="button" data-fmt="webp" class="active">WEBP</button>
+      <button type="button" data-fmt="png">PNG</button>
+    </div>
     <div class="progress" id="progress"><div class="progress-bar" id="progress-bar"></div></div>
     <div id="drop-status" class="drop-status"></div>
   </div>
@@ -304,13 +324,13 @@
 
   <div class="recent-head">
     <div class="label">RECENT</div>
-    <div id="recent-count" class="count">0 links</div>
+    <div class="count"><a href="#" id="sync-server">sync from server</a> · <span id="recent-count">0 links</span></div>
   </div>
   <div id="recent" class="recent"></div>
   <div id="recent-empty" class="empty">no uploads yet — paste or drop something above</div>
 
   <footer>
-    docshare · 24h TTL · <a href="#" id="clear-recent">clear local history</a>
+    docshare · 24h TTL · <a href="#" id="clear-recent">clear local history</a> · <a href="#" id="unlock-admin">unlock</a>
   </footer>
 </main>
 
@@ -345,10 +365,55 @@
 <script>
 (() => {
   const MAX_IMAGE_BYTES = 15 * 1024 * 1024
-  const MAX_DOC_BYTES = 300 * 1024 * 1024
+  const MAX_DOC_BYTES = 400 * 1024 * 1024
+  const MAX_DOC_BYTES_ADMIN = 1572864000   // 1.46 GB per file once unlocked
   const MAX_DIMENSION = 4096
   const RECENT_KEY = 'docshare.recent'
-  const MAX_RECENT = 20
+  const MAX_RECENT = 200
+  const ADMIN_KEY_LS = 'docshare.adminkey'
+  const OWNER_KEY_LS = 'docshare.ownertoken'
+  const FORMAT_KEY_LS = 'docshare.imageformat'
+  const IMAGE_FORMATS = ['webp', 'png']
+
+  // Selected image output format, persisted across sessions. Anything
+  // unrecognised in storage falls back to webp rather than propagating a bad
+  // value into the content-type header.
+  function outputFormat() {
+    const v = localStorage.getItem(FORMAT_KEY_LS)
+    return IMAGE_FORMATS.includes(v) ? v : 'webp'
+  }
+
+  // Owner bypass: when an admin password is stored locally, send it so the
+  // server skips the per-IP daily upload cap. No-op header when unset.
+  function adminKey() { return localStorage.getItem(ADMIN_KEY_LS) || '' }
+  // Server's verdict on the stored key, plus the doc cap it grants. Both are
+  // filled in by refreshUsage(); the constants above are the pre-fetch guess.
+  let serverAdmin = false
+  let serverDocMax = 0
+
+  // Ownership token: a random secret minted once per browser and sent on every
+  // upload and on /api/mine. The server stores only its hash and uses it to
+  // decide which uploads are "mine". This replaces IP as the ownership signal —
+  // behind CGNAT or an office NAT, an IP is shared with strangers, who could
+  // otherwise list and delete each other's uploads.
+  function ownerToken() {
+    let t = localStorage.getItem(OWNER_KEY_LS)
+    if (!t) {
+      const bytes = new Uint8Array(24)
+      crypto.getRandomValues(bytes)
+      t = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+      localStorage.setItem(OWNER_KEY_LS, t)
+    }
+    return t
+  }
+
+  function adminHeaders(base) {
+    const h = base ? { ...base } : {}
+    const k = adminKey()
+    if (k) h['x-admin-key'] = k
+    h['x-owner-token'] = ownerToken()
+    return h
+  }
 
   const $ = (id) => document.getElementById(id)
   const drop = $('drop')
@@ -435,9 +500,12 @@
   }
   async function refreshUsage() {
     try {
-      const res = await fetch('/api/usage')
+      const res = await fetch('/api/usage', { headers: adminHeaders() })
       if (!res.ok) return
       const u = await res.json()
+      serverAdmin = u.admin === true
+      serverDocMax = Number(u.docMax) || 0
+      syncUnlockLabel()
       const d = u.daily, s = u.storage
       const dPct = Math.max(d.count / d.countMax, d.bytes / d.bytesMax) * 100
       $('usage-daily-val').textContent = `${d.count}/${d.countMax} files · ${fmtBytes(d.bytes)} / ${fmtBytes(d.bytesMax)}`
@@ -492,7 +560,7 @@
     try {
       const res = await fetch('/api/delete', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: adminHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({ id: item.id }),
       })
       const data = await res.json().catch(() => ({}))
@@ -526,7 +594,14 @@
     if (!bytes) return ''
     if (bytes < 1024) return bytes + ' B'
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB'
-    return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+    if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+    return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB'
+  }
+  // The cap the server will actually enforce for this caller, once /api/usage
+  // has answered; before that, guess from whether a key is stored.
+  function docLimit() {
+    if (serverDocMax) return serverDocMax
+    return adminKey() ? MAX_DOC_BYTES_ADMIN : MAX_DOC_BYTES
   }
   function extOf(name) {
     const m = /\.([a-z0-9]+)$/i.exec(name || '')
@@ -646,6 +721,20 @@
     return hljsPromise
   }
 
+  // /d/<id>/<name> → /w/<id>/<name>. Derived from the stored URL so entries
+  // saved before this page existed get a working link too.
+  function watchUrlFor(item) {
+    try {
+      const u = new URL(item.url, location.origin)
+      u.pathname = u.pathname.replace(/^\/d\//, '/w/')
+      u.search = ''
+      return u.pathname
+    } catch {
+      return `/w/${item.id}`
+    }
+  }
+  function absUrl(path) { return new URL(path, location.origin).href }
+
   function itemEl(item) {
     const isDoc = item.kind === 'doc'
     const ct = (isDoc && item.contentType) || ''
@@ -735,7 +824,8 @@
     if (isDoc) {
       const dl = document.createElement('a')
       dl.className = 'btn'
-      dl.href = item.url
+      dl.href = item.url + (item.url.includes('?') ? '&' : '?') + 'dl=1'
+      dl.setAttribute('download', item.filename || item.id)
       dl.innerHTML = `${svgDownload()} Download`
       actions.appendChild(dl)
     } else {
@@ -746,19 +836,41 @@
       actions.appendChild(ocrBtn)
     }
 
+    if (isMedia) {
+      // Full-page player. Separate URL from the copied one on purpose: /d/
+      // stays the raw-bytes link agents get, /w/ is the human page.
+      const watch = document.createElement('a')
+      watch.className = 'btn'
+      watch.href = watchUrlFor(item)
+      watch.target = '_blank'
+      watch.rel = 'noopener'
+      watch.innerHTML = `${svgEye()} Watch`
+      actions.appendChild(watch)
+
+      const watchCopy = document.createElement('button')
+      watchCopy.className = 'btn'
+      watchCopy.innerHTML = `${svgCopy()} Watch link`
+      watchCopy.addEventListener('click', () => copy(absUrl(watchUrlFor(item)), 'watch link copied'))
+      actions.appendChild(watchCopy)
+    }
+
     if (isCode) {
-      // Open the file as readable text in a new tab (Download force-saves).
-      const rawBtn = document.createElement('button')
-      rawBtn.className = 'btn'
-      rawBtn.innerHTML = `${svgEye()} Raw`
-      rawBtn.addEventListener('click', async () => {
-        try {
-          const res = await fetch(item.url)
-          if (!res.ok) throw new Error()
-          const blob = new Blob([await res.text()], { type: 'text/plain;charset=utf-8' })
-          window.open(URL.createObjectURL(blob), '_blank', 'noopener')
-        } catch { toast('could not open raw') }
+      // Styled full-page viewer (rendered markdown / highlighted code).
+      const viewBtn = document.createElement('button')
+      viewBtn.className = 'btn'
+      viewBtn.innerHTML = `${svgEye()} View`
+      viewBtn.addEventListener('click', () => {
+        window.open(item.url, '_blank', 'noopener')
       })
+      actions.appendChild(viewBtn)
+
+      // Real, clean plain-text URL (like raw.githubusercontent.com) — no blob.
+      const rawBtn = document.createElement('a')
+      rawBtn.className = 'btn'
+      rawBtn.href = item.url + (item.url.includes('?') ? '&' : '?') + 'raw=1'
+      rawBtn.target = '_blank'
+      rawBtn.rel = 'noopener'
+      rawBtn.innerHTML = `${svgEye()} Raw`
       actions.appendChild(rawBtn)
     }
 
@@ -766,9 +878,13 @@
     curlBtn.className = 'btn'
     curlBtn.innerHTML = `${svgCopy()} cURL`
     curlBtn.addEventListener('click', () => {
+      // Re-derive the extension from the URL rather than trusting stored
+      // state: entries saved before the PNG toggle existed have no `format`,
+      // and the URL is always authoritative.
+      const imgExt = (item.url.match(/\.(webp|png)(?:$|\?)/) || [])[1] || 'webp'
       const cmd = isDoc
         ? `curl -L -o "${item.filename || item.id}" ${item.url}`
-        : `curl -o ${item.id}.webp ${item.url}`
+        : `curl -o ${item.id}.${imgExt} ${item.url}`
       copy(cmd, 'cURL copied')
     })
     actions.appendChild(curlBtn)
@@ -956,7 +1072,9 @@
     }
     return jsWebpPromise
   }
-  async function toWebp(file) {
+  // Encode to the selected output format. Returns a Blob whose type is the
+  // content-type the server will use to pick the stored extension.
+  async function encodeImage(file, format) {
     let bitmap
     try { bitmap = await createImageBitmap(file) }
     catch { throw new Error('cannot decode image') }
@@ -972,6 +1090,25 @@
     ctx.drawImage(bitmap, 0, 0, width, height)
     bitmap.close?.()
 
+    if (format === 'png') return toPngBlob(canvas, width, height)
+    return toWebpBlob(canvas, ctx, width, height)
+  }
+
+  // PNG is lossless — there is no quality knob to walk down, so this is
+  // single-shot. Oversized output is a hard failure with a pointer at WEBP
+  // rather than a retry loop that cannot converge.
+  // toBlob('image/png') is universally reliable, so none of the iOS WebP
+  // fallback machinery below applies here.
+  async function toPngBlob(canvas, width, height) {
+    const blob = await new Promise((res) => canvas.toBlob((b) => res(b), 'image/png'))
+    if (!blob) throw new Error('could not encode PNG')
+    if (blob.size > MAX_IMAGE_BYTES) {
+      throw new Error(`PNG too large (${fmtSize(blob.size)}) — switch to WEBP`)
+    }
+    return blob
+  }
+
+  async function toWebpBlob(canvas, ctx, width, height) {
     let nativeBroken = false
     const nativeEncode = (q) => new Promise((res) => canvas.toBlob((b) => res(b), 'image/webp', q))
     const jsEncode = async (q) => {
@@ -1002,13 +1139,14 @@
 
   // ----- image upload (through Worker) -----
   async function uploadImage(file, autocopy = true) {
-    setStatus('converting to WebP…')
-    const webp = await toWebp(file)
-    setStatus(`uploading ${(webp.size / 1024).toFixed(0)} KB…`)
+    const fmt = outputFormat()
+    setStatus(`converting to ${fmt.toUpperCase()}…`)
+    const encoded = await encodeImage(file, fmt)
+    setStatus(`uploading ${(encoded.size / 1024).toFixed(0)} KB…`)
     const res = await fetch('/api/upload', {
       method: 'POST',
-      headers: { 'content-type': 'image/webp' },
-      body: webp,
+      headers: adminHeaders({ 'content-type': `image/${fmt}` }),
+      body: encoded,
     })
     const data = await res.json()
     if (!res.ok) {
@@ -1016,9 +1154,10 @@
       if (err === 'rate_limited') throw new Error('rate limited — wait a minute')
       if (err === 'too_large') throw new Error('too large after compression')
       if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
+      if (err === 'unsupported_format' || err === 'format_mismatch') throw new Error('image format rejected by server')
       throw new Error(err)
     }
-    pushRecent({ kind: 'image', id: data.id, url: data.url, uploadedAt: data.uploadedAt, expiresAt: data.expiresAt, size: data.size })
+    pushRecent({ kind: 'image', id: data.id, url: data.url, format: data.format, uploadedAt: data.uploadedAt, expiresAt: data.expiresAt, size: data.size })
     if (autocopy) copy(data.url, 'uploaded · URL copied')
     setStatus('')
   }
@@ -1036,11 +1175,12 @@
     })
   }
   async function uploadDoc(file, autocopy = true) {
-    if (file.size > MAX_DOC_BYTES) throw new Error('file too large (300 MB max)')
+    const docMax = docLimit()
+    if (file.size > docMax) throw new Error(`file too large (${fmtSize(docMax)} max)`)
     setStatus('preparing upload…')
     const presignRes = await fetch('/api/doc/presign', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ filename: file.name, size: file.size, contentType: file.type || 'application/octet-stream' }),
     })
     const presign = await presignRes.json()
@@ -1050,7 +1190,7 @@
       if (err === 'daily_count') throw new Error('daily upload limit reached')
       if (err === 'daily_bytes') throw new Error('daily size limit reached')
       if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
-      if (err === 'too_large') throw new Error('file too large (300 MB max)')
+      if (err === 'too_large') throw new Error(`file too large (${fmtSize(presign.max || docMax)} max)`)
       throw new Error(err)
     }
 
@@ -1069,14 +1209,14 @@
 
     const finalizeRes = await fetch('/api/doc/finalize', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ id: presign.id }),
     })
     const finalized = await finalizeRes.json().catch(() => ({}))
     if (!finalizeRes.ok) {
       const err = finalized.error || `http ${finalizeRes.status}`
       if (err === 'storage_full') throw new Error('service storage is full — delete a file or try later')
-      if (err === 'too_large') throw new Error('file too large (300 MB max)')
+      if (err === 'too_large') throw new Error(`file too large (${fmtSize(finalized.max || docMax)} max)`)
       throw new Error(err)
     }
 
@@ -1173,6 +1313,70 @@
     if (text && text.trim()) uploadSnippet(text)
   })
 
+  function syncUnlockLabel() {
+    const el = $('unlock-admin')
+    if (!el) return
+    if (!adminKey()) el.textContent = 'unlock'
+    else el.textContent = serverAdmin ? 'unlocked ✓' : 'key not accepted'
+  }
+  $('unlock-admin').addEventListener('click', async (e) => {
+    e.preventDefault()
+    const cur = adminKey()
+    const next = prompt(cur ? 'Admin password (blank to lock):' : 'Admin password to bypass the daily limit:', cur)
+    if (next === null) return
+    if (!next.trim()) {
+      localStorage.removeItem(ADMIN_KEY_LS)
+      serverAdmin = false
+      syncUnlockLabel()
+      refreshUsage()
+      setStatus('locked')
+      return
+    }
+    localStorage.setItem(ADMIN_KEY_LS, next.trim())
+    setStatus('checking key…')
+    await refreshUsage()
+    if (serverAdmin) {
+      setStatus(`admin unlocked · daily limit bypassed · ${fmtSize(docLimit())} per file`)
+    } else {
+      localStorage.removeItem(ADMIN_KEY_LS)
+      syncUnlockLabel()
+      setStatus('wrong admin password')
+    }
+  })
+  syncUnlockLabel()
+
+  // Pull the server's view of uploads this IP (or all, when admin-unlocked) can
+  // claim, and merge them into local history so a fresh device sees them too.
+  async function syncFromServer() {
+    const link = $('sync-server')
+    if (link) { link.textContent = 'syncing…'; link.style.pointerEvents = 'none' }
+    try {
+      const res = await fetch('/api/mine', { headers: adminHeaders() })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `http ${res.status}`)
+      const server = Array.isArray(data.items) ? data.items : []
+      const now = Date.now()
+      const have = loadRecent()
+      const byId = new Map(have.map((x) => [x.id, x]))
+      for (const it of server) {
+        if (!it || !it.id) continue
+        if (it.expiresAt && it.expiresAt <= now) continue
+        // Keep any richer local entry; otherwise adopt the server row.
+        byId.set(it.id, { ...it, ...(byId.get(it.id) || {}) })
+      }
+      const merged = [...byId.values()].sort((a, b) => (b.uploadedAt || 0) - (a.uploadedAt || 0))
+      saveRecent(merged)
+      renderRecent()
+      const added = merged.length - have.length
+      setStatus(`synced ${server.length} from server${data.admin ? ' (all uploads)' : ''}${added > 0 ? ' · ' + added + ' new' : ''}`)
+    } catch (err) {
+      setStatus('sync failed: ' + err.message, true)
+    } finally {
+      if (link) { link.textContent = 'sync from server'; link.style.pointerEvents = '' }
+    }
+  }
+  $('sync-server').addEventListener('click', (e) => { e.preventDefault(); syncFromServer() })
+
   $('clear-recent').addEventListener('click', async (e) => {
     e.preventDefault()
     const ok = await confirmDialog({
@@ -1195,6 +1399,31 @@
       if (exp) exp.textContent = expiresLabel(item.expiresAt)
     })
   }, 30000)
+
+  // ----- image format toggle -----
+  function syncFormatUI() {
+    const fmt = outputFormat()
+    document.querySelectorAll('#format-seg button').forEach((b) => {
+      b.classList.toggle('active', b.dataset.fmt === fmt)
+      b.setAttribute('aria-pressed', String(b.dataset.fmt === fmt))
+    })
+    const sub = $('drop-sub')
+    if (sub) {
+      sub.textContent = fmt === 'png'
+        ? 'images → PNG (lossless, larger) · any file ≤ 400 MB (1.46 GB unlocked) · 24h TTL · sent straight to storage'
+        : 'images → WebP · any file ≤ 400 MB (1.46 GB unlocked) · 24h TTL · sent straight to storage'
+    }
+  }
+  document.querySelectorAll('#format-seg button').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      // The drop zone is itself a click-to-browse target.
+      e.preventDefault()
+      e.stopPropagation()
+      localStorage.setItem(FORMAT_KEY_LS, b.dataset.fmt)
+      syncFormatUI()
+    })
+  })
+  syncFormatUI()
 
   renderRecent()
   refreshUsage()

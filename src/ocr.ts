@@ -3,6 +3,7 @@ const OCR_PROMPT =
 
 export async function runOcr(
   imageBytes: ArrayBuffer,
+  mimeType: string,
   apiKey: string,
   model: string,
 ): Promise<string> {
@@ -16,7 +17,9 @@ export async function runOcr(
         parts: [
           {
             inline_data: {
-              mime_type: 'image/webp',
+              // Must match the bytes actually sent. Hardcoding image/webp here
+              // meant PNG uploads were handed to Gemini mislabelled.
+              mime_type: mimeType,
               data: arrayBufferToBase64(imageBytes),
             },
           },

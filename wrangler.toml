@@ -8,7 +8,7 @@ compatibility_date = "2025-01-15"
 pattern = "docs.safzan.dev"
 custom_domain = true
 
-# R2 bucket holding img/{id}.webp, doc/{id}, and meta/{id}.json objects.
+# R2 bucket holding img/{id}.{webp,png}, doc/{id}, and meta/{id}.json objects.
 # Separate from the seeshare bucket so share.safzan.dev is untouched.
 # Configure a lifecycle rule on this bucket to delete objects older than 1 day
 # (instructions in README). The lifecycle rule is what enforces the TTL.
@@ -62,9 +62,10 @@ crons = ["*/30 * * * *"]
 PUBLIC_ORIGIN = "https://docs.safzan.dev"
 TTL_HOURS = "24"
 GEMINI_MODEL = "gemini-3.1-flash-lite"
-MAX_UPLOAD_BYTES = "15728640"      # 15 MB, images (webp)
-MAX_DOC_BYTES = "314572800"        # 300 MB, docs
-DOC_DAILY_COUNT = "5"              # docs per IP per day
+MAX_UPLOAD_BYTES = "15728640"      # 15 MB per encoded image (webp or png)
+MAX_DOC_BYTES = "419430400"        # 400 MB, docs
+MAX_ADMIN_DOC_BYTES = "1572864000" # 1.46 GiB per doc when unlocked with the admin key
+DOC_DAILY_COUNT = "10"             # docs per IP per day
 DOC_DAILY_BYTES = "1572864000"     # 1.5 GB per IP per day
 MAX_TOTAL_BYTES = "9000000000"     # 9 GB global hard cap (R2 free tier is 10 GB)
 R2_BUCKET_NAME = "docshare"        # used by the S3 presigner
