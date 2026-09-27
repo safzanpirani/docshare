@@ -10,9 +10,11 @@ fetch. Everything auto-deletes after 24 hours.
 
 ## Commands
 
-On this Mac, `docshare` is on PATH. Elsewhere, run the script next to this
-file: `upload.sh` (macOS, Linux, WSL, git-bash) or `upload.ps1` (native
-Windows PowerShell). Both take the same commands.
+Try `docshare` first: it is on PATH wherever the launcher is installed (a
+one-line wrapper around the script, `docshare.cmd` on Windows). Otherwise run
+the script next to this file: `upload.sh` (macOS, Linux, WSL, git-bash) or
+`upload.ps1` (native Windows PowerShell). Both take the same commands. On
+Windows the switches are PowerShell style (`-Json`, `-Raw`, `-MakeRoom`).
 
 ```bash
 docshare report.pdf                 # prints the share URL
