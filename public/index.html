@@ -1162,6 +1162,30 @@
     setStatus('')
   }
 
+  // ----- make room -----
+  // A cap that blocks an upload can often be cleared by deleting the user's own
+  // older uploads. The server picks them (oldest first, only ones it can prove
+  // are yours) — ask it for the plan, show it, and only then delete.
+  const ROOM_ERRORS = new Set(['daily_count', 'daily_bytes', 'storage_full'])
+  async function offerMakeRoom(bytes) {
+    const res = await fetch('/api/make-room', {
+      method: 'POST',
+      headers: adminHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ bytes, dryRun: true }),
+    })
+    const plan = await res.json().catch(() => ({}))
+    const doomed = plan.wouldDelete || []
+    if (!res.ok || !plan.fits || !doomed.length) return false
+    const names = doomed.map((i) => `“${i.filename || i.id}”`).join(', ')
+    const noun = doomed.length === 1 ? 'upload' : `${doomed.length} uploads`
+    return confirmDialog({
+      title: 'Make room for this upload?',
+      message: `You've hit a limit. Deleting your oldest ${noun} (${names}) frees enough for this file.`,
+      confirmLabel: 'Delete & upload',
+      danger: true,
+    })
+  }
+
   // ----- doc upload (presigned, direct to R2) -----
   function putWithProgress(url, file, onProgress) {
     return new Promise((resolve, reject) => {
@@ -1178,12 +1202,20 @@
     const docMax = docLimit()
     if (file.size > docMax) throw new Error(`file too large (${fmtSize(docMax)} max)`)
     setStatus('preparing upload…')
-    const presignRes = await fetch('/api/doc/presign', {
+    const requestPresign = (makeRoom) => fetch('/api/doc/presign', {
       method: 'POST',
       headers: adminHeaders({ 'content-type': 'application/json' }),
-      body: JSON.stringify({ filename: file.name, size: file.size, contentType: file.type || 'application/octet-stream' }),
+      body: JSON.stringify({ filename: file.name, size: file.size, contentType: file.type || 'application/octet-stream', makeRoom }),
     })
-    const presign = await presignRes.json()
+    let presignRes = await requestPresign(false)
+    let presign = await presignRes.json()
+    if (!presignRes.ok && ROOM_ERRORS.has(presign.error) && await offerMakeRoom(file.size)) {
+      setStatus('making room…')
+      presignRes = await requestPresign(true)
+      presign = await presignRes.json()
+    }
+    for (const e of presign.evicted || []) removeRecent(e.id)
+    if (presign.evicted && presign.evicted.length) refreshUsage()
     if (!presignRes.ok) {
       const err = presign.error || `http ${presignRes.status}`
       if (err === 'rate_limited') throw new Error('rate limited — wait a minute')

@@ -162,13 +162,45 @@ bucket + token + CORS must exist for doc uploads to work locally.
 | `POST /api/upload` | image: `image/webp` or `image/png` bytes (≤ 15 MB). Returns `{ id, url, format, ... }` |
 | `GET /i/:id.{webp,png}` | streams an image |
 | `POST /api/ocr/:id` | OCR an image (cached); `ocr_disabled` if no Gemini key |
-| `POST /api/doc/presign` | body `{ filename, size, contentType }` → `{ id, putUrl, downloadUrl, ... }` |
+| `PUT /upload/:filename` | one-shot upload ≤ 100 MB; bare URL back, or JSON `{ id, url, rawUrl, expiresAt, ... }` with `Accept: application/json` |
+| `POST /api/doc/presign` | body `{ filename, size, contentType, makeRoom? }` → `{ id, putUrl, downloadUrl, rawUrl, ... }` |
 | `POST /api/doc/finalize` | body `{ id }` — confirms upload, enforces max size |
 | `GET /d/:id/:filename` | streams a doc as a forced download |
 | `GET /api/info/:id` | metadata for an image or doc |
 | `GET /api/mine` | uploads the caller can claim — see Ownership below |
 | `POST /api/delete` | body `{ id }` — deletes; the id is the capability |
+| `DELETE /d/:id/:filename`, `DELETE /i/:id.{webp,png}` | same delete, addressed by the share URL |
+| `POST /api/make-room` | body `{ bytes, dryRun? }` — deletes the caller's oldest uploads until `bytes` fits |
 | `GET /api/usage` | caller's daily quota + the shared storage cap |
+
+Errors are JSON `{ error, hint, ... }` with a stable `error` code. Cap errors
+carry the numbers: `daily_count`/`daily_bytes` add `limit`, `used` and
+`resetsAt`; `storage_full` adds `used` and `cap`; `rate_limited` adds
+`retryAfter` and a `Retry-After` header. `PUT /upload` returns the same code
+and hint as plain text.
+
+### Making room
+
+A full daily cap or storage cap does not have to be a dead end. The caller can
+delete its own uploads to free space:
+
+- `POST /api/make-room` with `{ "bytes": <size of the next upload> }` deletes
+  the caller's oldest uploads until that upload fits. `"dryRun": true` returns
+  the plan (`wouldDelete`) without deleting.
+- `"makeRoom": true` on `/api/doc/presign`, or an `x-make-room: 1` header on
+  either upload route, does the same inline and lists what it removed in
+  `evicted` (and the `x-docshare-evicted` header).
+
+Only uploads the caller owns are candidates. The admin key does not widen that.
+For the daily caps, only docs uploaded today from the caller's IP count,
+because only those refund that counter. Presigned uploads abandoned for over
+30 minutes count too. When the caller's uploads cannot free enough, the
+request returns `409 cannot_make_room` with the `shortfall` and deletes
+nothing.
+
+Deleting a doc uploaded today refunds the daily quota to the counter that paid
+for it. The refund applies when the caller has the same IP or the same owner
+token as the uploader.
 
 ### Ownership (`/api/mine`)
 
@@ -181,7 +213,7 @@ The token exists because IP alone is not an identity: behind CGNAT, a corporate
 NAT, or a mobile carrier, unrelated people share a public IP and would otherwise
 see — and be able to delete — each other's uploads.
 
-`/api/mine` and `/api/delete` additionally reject browser requests carrying a
+`/api/mine`, `/api/delete`, `/api/make-room` and `DELETE` on share URLs reject browser requests carrying a
 cross-origin `Origin` header, so a page a user happens to visit cannot enumerate
 their uploads. Requests with no `Origin` (curl, agents) are unaffected.
 
@@ -208,14 +240,16 @@ The values actually deployed live in `wrangler.toml`.
 
 ```sh
 npm run typecheck   # tsc --noEmit
-npm test            # vitest — pure logic: quotas, storage counter, headers, ids
+npm test            # vitest — quotas, storage counter, headers, ids, routes
 npm run check       # both; this is what CI runs
 ```
 
 The suite covers the accounting logic (daily quota charge/refund, the global
 storage counter and its cron reconciliation), the header/filename/range helpers,
-and ownership matching. It uses in-memory KV/R2 fakes (`test/fakes.ts`) — no
-Workers runtime and no network, so it runs in well under a second.
+ownership matching, the make-room planner, and the upload/delete/make-room
+routes end to end. It uses in-memory KV/R2 fakes (`test/fakes.ts`,
+`test/app-fakes.ts`) — no Workers runtime and no network, so it runs in well
+under a second.
 
 ## Known limitations
 
@@ -224,7 +258,8 @@ Workers runtime and no network, so it runs in well under a second.
   burst binding covers the concurrent case; `finalize` deletes any object that
   came in over `MAX_DOC_BYTES`.
 - A client that presigns but never PUTs still consumes one count/declared-bytes
-  for the day. The TTL lifecycle rule bounds any orphaned storage.
+  for the day, until `make-room` reclaims it (after 30 minutes) or the day
+  rolls over. The TTL lifecycle rule bounds any orphaned storage.
 - **PNG output and the 15 MB image cap.** `MAX_UPLOAD_BYTES` was sized for lossy
   WebP. PNG is lossless, so there is no quality knob to walk down: the encoder
   is single-shot and a large screenshot can exceed the cap outright, failing

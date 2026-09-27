@@ -35,16 +35,57 @@ The agent then has a `docshare` skill that takes a local file path and returns
 the share URL. Works with Claude Code, opencode, and the other agents the
 `skills` package supports.
 
+## Agent recipes
+
+Pick one random secret (16–128 chars of `[A-Za-z0-9_-]`), keep it, and send it
+as `x-owner-token` on every call. It is how docshare knows which uploads are
+yours, so you can list, delete, and make room later.
+
+```bash
+T=my-agent-token-0123456789
+# upload, get JSON back (id, url, rawUrl, expiresAt)
+curl -sT build.log -H "x-owner-token: $T" -H 'accept: application/json' \
+  https://docs.safzan.dev/upload/build.log
+# list your uploads
+curl -s -H "x-owner-token: $T" https://docs.safzan.dev/api/mine
+# delete one: DELETE the share URL you were given
+curl -s -X DELETE -H "x-owner-token: $T" https://docs.safzan.dev/d/<id>/build.log
+# hit a daily or storage cap? delete your oldest uploads and retry in one go
+curl -sT big.zip -H "x-owner-token: $T" -H 'x-make-room: 1' \
+  https://docs.safzan.dev/upload/big.zip
+```
+
+Give a human the plain URL (it renders in a browser). Give another agent the
+`rawUrl` (`?raw=1`) when it should read the file contents.
+
+## Errors
+
+Every error is JSON `{"error": "<code>", "hint": "<what to do next>", ...}`
+(`PUT /upload` returns the same code and hint as plain text). Codes that
+matter:
+
+- `daily_count` / `daily_bytes` (429) — per-IP daily cap. Includes `limit`,
+  `used`, `resetsAt`. Make room (below) or wait for `resetsAt`.
+- `storage_full` (507) — service-wide cap. Includes `used`, `cap`. Make room or
+  retry later.
+- `rate_limited` (429) — burst limit. Wait `retryAfter` seconds (also sent as
+  `Retry-After`) and retry.
+- `too_large` (413) — includes `max`.
+- `cannot_make_room` (409) — your own uploads cannot free enough; nothing was
+  deleted. Includes `shortfall`.
+
 ## API
 
 - [PUT /upload/:filename](https://docs.safzan.dev/upload/) — simple one-shot
-  upload, ≤100 MB. Body: raw file bytes. Response: plain-text download URL.
+  upload, ≤100 MB. Body: raw file bytes. Response: plain-text download URL, or
+  JSON `{id, url, rawUrl, filename, size, uploadedAt, expiresAt}` when you send
+  `Accept: application/json`.
 - [POST /api/upload](https://docs.safzan.dev/api/upload) — image upload, body
   must be `image/webp` or `image/png` bytes (≤15 MB). Returns JSON `{id, url, format, uploadedAt,
   expiresAt, size}`.
 - [POST /api/doc/presign](https://docs.safzan.dev/api/doc/presign) — step 1 of
-  3 for large docs. Body: `{filename, size, contentType}`. Returns `{id,
-  putUrl, downloadUrl, uploadedAt, expiresAt, size}`. PUT the file bytes
+  3 for large docs. Body: `{filename, size, contentType, makeRoom?}`. Returns
+  `{id, putUrl, downloadUrl, rawUrl, uploadedAt, expiresAt, size}`. PUT the file bytes
   directly to `putUrl` (a presigned R2 S3 URL), then POST to /api/doc/finalize.
 - [POST /api/doc/finalize](https://docs.safzan.dev/api/doc/finalize) — step 3.
   Body: `{id}`. Confirms the upload landed and enforces max size.
@@ -62,11 +103,22 @@ the share URL. Works with Claude Code, opencode, and the other agents the
   an image or a doc.
 - [POST /api/delete](https://docs.safzan.dev/api/delete) — delete by `{id}`.
   The id is the capability: anyone holding it can delete the file.
+- DELETE /d/:id/:filename or DELETE /i/:id.webp — the same delete, addressed
+  by the share URL.
+- POST /api/make-room — body `{bytes, dryRun?}`. Deletes your oldest uploads
+  (only yours, matched by `x-owner-token`) until one more upload of `bytes`
+  fits under the daily and storage caps. Returns `{fits, deleted, need,
+  shortfall}`; with `dryRun: true`, returns `wouldDelete` and deletes nothing.
+  The same thing happens inline when an upload sends `x-make-room: 1` (or
+  `"makeRoom": true` to presign); removed items come back as `evicted`.
+- GET /api/usage — your daily quota use and the service storage use.
+  Deleting a doc you uploaded today refunds that day's quota.
 - GET /api/mine — list uploads you can claim. Ownership is proved by the
   `x-owner-token` header (any opaque 16–128 char `[A-Za-z0-9_-]` secret you
   mint and reuse); uploads made while sending it are listed back to you. Sent
   no token? You get the uploads made from your IP that carry no owner token.
-  Browsers may only call this (and /api/delete) from the app's own origin.
+  Browsers may only call this (and the delete and make-room endpoints) from
+  the app's own origin.
 
 ## Limits
 

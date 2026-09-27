@@ -40,7 +40,16 @@ import { mediaPage, MEDIA_CSP } from './media'
 import { runOcr } from './ocr'
 import { OWNER_TOKEN_HEADER, ownerTagFrom, ownsItem } from './owner'
 import { presignPutUrl } from './presign'
-import { checkAndChargeDaily, hashIp, readDailyUsage, refundChargedDaily, refundDaily } from './ratelimit'
+import {
+  checkAndChargeDaily,
+  dailyResetAt,
+  hashIp,
+  readDailyUsage,
+  refundChargedDaily,
+  refundDaily,
+  refundsCallerToday,
+} from './ratelimit'
+import { type RoomCandidate, type RoomNeed, computeNeed, isBlocked, planRoom } from './room'
 import { addStorageUsed, getStorageUsed, reconcileStorage, withinStorageCap } from './storage'
 import { VIEWER_CSP, viewerPage } from './viewer'
 
@@ -140,6 +149,59 @@ const sameOriginOnly: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next
 }
 app.use('/api/mine', sameOriginOnly)
 app.use('/api/delete', sameOriginOnly)
+app.use('/api/make-room', sameOriginOnly)
+
+// ---- Agent-facing errors: a stable `error` code, the numbers behind it, and
+// the next step in `hint`, so a model can recover without reading the docs.
+const ROOM_HINT =
+  'Free space by deleting your own uploads (POST /api/delete {"id"}, or DELETE on the share URL), ' +
+  'or retry with "makeRoom": true in the JSON body / an `x-make-room: 1` header to delete your oldest ' +
+  'uploads automatically (preview with POST /api/make-room {"bytes", "dryRun": true}).'
+
+function quotaErrorBody(q: { reason: 'daily_count' | 'daily_bytes'; limit: number; used: number }) {
+  const what = q.reason === 'daily_count' ? 'upload count' : 'byte'
+  return {
+    error: q.reason,
+    limit: q.limit,
+    used: q.used,
+    resetsAt: dailyResetAt(),
+    hint: `Daily per-IP ${what} cap reached. ${ROOM_HINT} Otherwise wait until resetsAt.`,
+  }
+}
+
+async function storageFullBody(kv: KVNamespace, cap: number) {
+  return {
+    error: 'storage_full' as const,
+    used: await getStorageUsed(kv),
+    cap,
+    hint: `The service-wide storage cap is reached. ${ROOM_HINT} Otherwise retry later; every upload expires within 24 h.`,
+  }
+}
+
+const RATE_LIMIT_RETRY_SECONDS = 60
+function rateLimitedJson(c: Context<{ Bindings: Bindings }>) {
+  c.header('retry-after', String(RATE_LIMIT_RETRY_SECONDS))
+  return c.json({
+    error: 'rate_limited',
+    retryAfter: RATE_LIMIT_RETRY_SECONDS,
+    hint: 'Burst limit hit. Wait retryAfter seconds, then retry the same request.',
+  }, 429)
+}
+
+// Plain-text form of an error body for PUT /upload, whose success response is
+// a bare URL: the code first (unchanged from before), then the hint.
+function errorText(body: { error: string; hint?: string; limit?: number }): string {
+  const limit = body.limit !== undefined ? ` (limit ${body.limit})` : ''
+  return `${body.error}${limit}\n${body.hint ? `hint: ${body.hint}\n` : ''}`
+}
+
+function wantsMakeRoom(c: Context<{ Bindings: Bindings }>, bodyFlag?: unknown): boolean {
+  return bodyFlag === true || c.req.header('x-make-room') === '1'
+}
+
+function docUrl(origin: string, id: string, filename: string): string {
+  return `${origin}/d/${id}/${encodeURIComponent(filename)}`
+}
 
 app.get('/', (c) => {
   c.header('cache-control', 'public, max-age=300')
@@ -220,7 +282,10 @@ app.get('/sw.js', (c) => {
 app.put('/upload/:filename', async (c) => {
   const ip = clientIp(c.req.raw)
   const burst = await c.env.DOC_LIMITER.limit({ key: ip })
-  if (!burst.success) return c.text('rate_limited\n', 429)
+  if (!burst.success) {
+    c.header('retry-after', String(RATE_LIMIT_RETRY_SECONDS))
+    return c.text(`rate_limited\nhint: wait ${RATE_LIMIT_RETRY_SECONDS}s and retry\n`, 429)
+  }
 
   const cfg = readConfig(c.env)
   const filenameRaw = c.req.param('filename') ?? 'file'
@@ -237,14 +302,20 @@ app.put('/upload/:filename', async (c) => {
     return c.text(`too_large: simple upload route caps at ${SIMPLE_UPLOAD_MAX} bytes. Use POST /api/doc/presign for files up to ${cfg.maxDocBytes} bytes.\n`, 413)
   }
 
+  const charged = !isAdmin(c)
+  const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  const evicted = wantsMakeRoom(c)
+    ? (await makeRoom(c.env, ip, callerOwnerTag, declared, charged, false)).deleted
+    : []
+  if (evicted.length) c.header('x-docshare-evicted', evicted.map((e) => e.id).join(','))
+
   if (!(await withinStorageCap(c.env.QUOTA, declared, cfg.maxTotalBytes))) {
-    return c.text('storage_full: service storage cap reached, try again later\n', 507)
+    return c.text(errorText(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes)), 507)
   }
 
-  const charged = !isAdmin(c)
   if (charged) {
     const quota = await checkAndChargeDaily(c.env.QUOTA, ip, declared, cfg.dailyCount, cfg.dailyBytes)
-    if (!quota.ok) return c.text(`${quota.reason} (limit ${quota.limit})\n`, 429)
+    if (!quota.ok) return c.text(errorText(quotaErrorBody(quota)), 429)
   }
   const refund = async () => { if (charged) await refundChargedDaily(c.env.QUOTA, ip, declared) }
 
@@ -261,7 +332,7 @@ app.put('/upload/:filename', async (c) => {
   }
   if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, cfg.maxTotalBytes))) {
     await refund()
-    return c.text('storage_full: service storage cap reached, try again later\n', 507)
+    return c.text(errorText(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes)), 507)
   }
 
   id = generateId(16)
@@ -283,7 +354,7 @@ app.put('/upload/:filename', async (c) => {
       expiresAt,
       finalized: true,
       uploaderTag: await hashIp(ip),
-      ownerTag: await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER)),
+      ownerTag: callerOwnerTag,
     }
     await c.env.BUCKET.put(`meta/${id}.json`, JSON.stringify(meta), {
       httpMetadata: { contentType: 'application/json' },
@@ -300,7 +371,15 @@ app.put('/upload/:filename', async (c) => {
     throw e
   }
 
-  const url = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
+  const url = docUrl(c.env.PUBLIC_ORIGIN, id, filename)
+  // Agents that ask for JSON get the id (for delete) and expiry alongside the
+  // URL; the default stays a bare URL so `curl -T` output is directly usable.
+  if ((c.req.header('accept') || '').includes('application/json')) {
+    return c.json({
+      id, url, rawUrl: `${url}?raw=1`, filename, size: buf.byteLength, uploadedAt, expiresAt,
+      ...(evicted.length ? { evicted } : {}),
+    })
+  }
   c.header('content-type', 'text/plain; charset=utf-8')
   return c.body(url + '\n')
 })
@@ -312,7 +391,7 @@ app.put('/upload/:filename', async (c) => {
 app.post('/api/upload', async (c) => {
   const ip = clientIp(c.req.raw)
   const { success } = await c.env.UPLOAD_LIMITER.limit({ key: ip })
-  if (!success) return c.json({ error: 'rate_limited' }, 429)
+  if (!success) return rateLimitedJson(c)
 
   const cfg = readConfig(c.env)
   const max = cfg.maxUploadBytes
@@ -333,7 +412,7 @@ app.post('/api/upload', async (c) => {
   }
 
   if (!(await withinStorageCap(c.env.QUOTA, buf.byteLength, cfg.maxTotalBytes))) {
-    return c.json({ error: 'storage_full' }, 507)
+    return c.json(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes), 507)
   }
 
   // Ids are bare (no extension) for clients, so uniqueness has to hold across
@@ -413,7 +492,7 @@ app.post('/api/ocr/:id', async (c) => {
   // limiter is the only thing bounding that spend.
   const ip = clientIp(c.req.raw)
   const { success } = await c.env.OCR_LIMITER.limit({ key: ip })
-  if (!success) return c.json({ error: 'rate_limited' }, 429)
+  if (!success) return rateLimitedJson(c)
 
   const cached = await c.env.BUCKET.get(`img/${id}.ocr.json`)
   if (cached) {
@@ -456,11 +535,11 @@ app.post('/api/ocr/:id', async (c) => {
 app.post('/api/doc/presign', async (c) => {
   const ip = clientIp(c.req.raw)
   const { success } = await c.env.DOC_LIMITER.limit({ key: ip })
-  if (!success) return c.json({ error: 'rate_limited' }, 429)
+  if (!success) return rateLimitedJson(c)
 
   const cfg = readConfig(c.env)
 
-  let body: { filename?: unknown; size?: unknown; contentType?: unknown }
+  let body: { filename?: unknown; size?: unknown; contentType?: unknown; makeRoom?: unknown }
   try {
     body = await c.req.json()
   } catch {
@@ -472,13 +551,23 @@ app.post('/api/doc/presign', async (c) => {
   const contentType = String(body.contentType ?? 'application/octet-stream')
 
   const maxDoc = isAdmin(c) ? cfg.maxAdminDocBytes : cfg.maxDocBytes
-  if (!Number.isFinite(size) || size <= 0) return c.json({ error: 'bad_size' }, 400)
-  if (size > maxDoc) return c.json({ error: 'too_large', max: maxDoc }, 413)
+  if (!Number.isFinite(size) || size <= 0) {
+    return c.json({ error: 'bad_size', hint: 'Send the exact file size in bytes as a positive number.' }, 400)
+  }
+  if (size > maxDoc) {
+    return c.json({ error: 'too_large', max: maxDoc, hint: `Files over ${maxDoc} bytes are refused; split or compress the file.` }, 413)
+  }
+
+  const charged = !isAdmin(c)
+  const ownerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  const evicted = wantsMakeRoom(c, body.makeRoom)
+    ? (await makeRoom(c.env, ip, ownerTag, size, charged, false)).deleted
+    : []
 
   // Global storage cap. The bytes are charged to the counter at /finalize with
   // the real object size; here we only reject if the declared size wouldn't fit.
   if (!(await withinStorageCap(c.env.QUOTA, size, cfg.maxTotalBytes))) {
-    return c.json({ error: 'storage_full' }, 507)
+    return c.json(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes), 507)
   }
 
   let id = generateId(16)
@@ -497,13 +586,9 @@ app.post('/api/doc/presign', async (c) => {
   }
 
   const uploaderTag = await hashIp(ip)
-  const ownerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
-  const charged = !isAdmin(c)
   if (charged) {
     const quota = await checkAndChargeDaily(c.env.QUOTA, ip, size, cfg.dailyCount, cfg.dailyBytes)
-    if (!quota.ok) {
-      return c.json({ error: quota.reason, limit: quota.limit }, 429)
-    }
+    if (!quota.ok) return c.json(quotaErrorBody(quota), 429)
   }
 
   const meta: DocMeta = {
@@ -526,8 +611,11 @@ app.post('/api/doc/presign', async (c) => {
     throw e
   }
 
-  const downloadUrl = `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`
-  return c.json({ id, putUrl, downloadUrl, filename, uploadedAt, expiresAt, size })
+  const downloadUrl = docUrl(c.env.PUBLIC_ORIGIN, id, filename)
+  return c.json({
+    id, putUrl, downloadUrl, rawUrl: `${downloadUrl}?raw=1`, filename, uploadedAt, expiresAt, size,
+    ...(evicted.length ? { evicted } : {}),
+  })
 })
 
 // Step 2 (optional but recommended): confirm the upload landed and enforce the
@@ -575,7 +663,7 @@ app.post('/api/doc/finalize', async (c) => {
     await c.env.BUCKET.delete(`meta/${id}.json`)
     if (previousFinalizedSize > 0) await addStorageUsed(c.env.QUOTA, -previousFinalizedSize)
     await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
-    return c.json({ error: 'storage_full' }, 507)
+    return c.json(await storageFullBody(c.env.QUOTA, cfg.maxTotalBytes), 507)
   }
 
   let storageAdjusted = 0
@@ -786,22 +874,37 @@ app.get('/api/usage', async (c) => {
 const MINE_SCAN_CAP = 5000 // safety bound on objects scanned per prefix
 const MINE_FETCH_CONCURRENCY = 50
 
-app.get('/api/mine', async (c) => {
-  const ip = clientIp(c.req.raw)
-  const admin = isAdmin(c)
+// An un-finalized doc (presigned, never confirmed) still holds a daily-quota
+// charge. Past this age its presigned URL is long dead, so make-room may treat
+// it as abandoned and reclaim the charge without racing a live upload.
+const ABANDONED_PRESIGN_MS = 30 * 60 * 1000
+
+type OwnedItem = RoomCandidate & {
+  contentType: string
+  expiresAt: number
+  url: string
+  finalized: boolean
+  format?: ImageFormat
+}
+
+async function listOwned(
+  env: Bindings,
+  ip: string,
+  callerOwnerTag: string | undefined,
+  admin: boolean,
+): Promise<OwnedItem[]> {
+  const cfg = readConfig(env)
   const callerIpTag = await hashIp(ip)
-  const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
-  const cfg = readConfig(c.env)
   const owns = (itemOwnerTag: unknown, itemUploaderTag: unknown) =>
     ownsItem({ admin, itemOwnerTag, itemUploaderTag, callerOwnerTag, callerIpTag })
 
-  const items: Array<Record<string, unknown>> = []
+  const items: OwnedItem[] = []
 
-  // Docs: metadata lives in meta/{id}.json; only surface finalized uploads.
+  // Docs: metadata lives in meta/{id}.json.
   const metaKeys: string[] = []
   let cursor: string | undefined
   do {
-    const listed = await c.env.BUCKET.list({ prefix: 'meta/', cursor, limit: 1000 })
+    const listed = await env.BUCKET.list({ prefix: 'meta/', cursor, limit: 1000 })
     for (const obj of listed.objects) {
       if (metaKeys.length >= MINE_SCAN_CAP) break
       const id = obj.key.slice('meta/'.length).replace(/\.json$/, '')
@@ -813,7 +916,7 @@ app.get('/api/mine', async (c) => {
   for (let i = 0; i < metaKeys.length; i += MINE_FETCH_CONCURRENCY) {
     const batch = metaKeys.slice(i, i + MINE_FETCH_CONCURRENCY)
     const metas = await Promise.all(batch.map(async (key) => {
-      const metaObj = await c.env.BUCKET.get(key)
+      const metaObj = await env.BUCKET.get(key)
       if (!metaObj) return undefined
       const meta = await metaObj.json<DocMeta>().catch(() => undefined)
       return meta ? { key, meta } : undefined
@@ -821,29 +924,33 @@ app.get('/api/mine', async (c) => {
     for (const entry of metas) {
       if (!entry) continue
       const { key, meta } = entry
-      if (meta.finalized !== true) continue
       if (!owns(meta.ownerTag, meta.uploaderTag)) continue
       const id = key.slice('meta/'.length).replace(/\.json$/, '')
       const filename = meta.filename || id
+      const finalized = meta.finalized === true
+      const uploadedAt = nonNegative(meta.uploadedAt)
       items.push({
-        kind: 'doc', id, filename,
+        kind: 'doc', id, filename, finalized,
         contentType: meta.contentType || 'application/octet-stream',
-        size: meta.size || 0,
-        uploadedAt: meta.uploadedAt || 0,
-        expiresAt: meta.expiresAt || 0,
-        url: `${c.env.PUBLIC_ORIGIN}/d/${id}/${encodeURIComponent(filename)}`,
+        // Only finalized docs are counted against the storage cap.
+        size: finalized ? nonNegative(meta.size) : 0,
+        chargedSize: chargedDocSize(meta, 0),
+        uploadedAt,
+        expiresAt: nonNegative(meta.expiresAt),
+        url: docUrl(env.PUBLIC_ORIGIN, id, filename),
+        refundsDaily: refundsCallerToday(callerIpTag, uploadedAt, meta.uploaderTag),
       })
     }
   }
 
   // Images: tags live in R2 customMetadata, returned by list() — no per-object
-  // fetch needed.
+  // fetch needed. Images never count against the daily doc quota.
   cursor = undefined
   let scanned = 0
   do {
     // include:['customMetadata'] is supported at runtime but missing from the
     // pinned R2ListOptions types — cast to reach it.
-    const listed = await c.env.BUCKET.list({ prefix: 'img/', cursor, limit: 1000, include: ['customMetadata'] } as R2ListOptions)
+    const listed = await env.BUCKET.list({ prefix: 'img/', cursor, limit: 1000, include: ['customMetadata'] } as R2ListOptions)
     for (const obj of listed.objects) {
       if (++scanned > MINE_SCAN_CAP) break
       // parseImageKey also filters out the img/{id}.ocr.json sidecars.
@@ -854,20 +961,120 @@ app.get('/api/mine', async (c) => {
       if (!owns(cm.ownerTag, cm.uploaderTag)) continue
       const uploadedAt = Number(cm.uploadedAt) || 0
       items.push({
-        kind: 'image', id,
-        format,
+        kind: 'image', id, format, filename: `${id}.${format}`, finalized: true,
         contentType: contentTypeFor(format),
         size: obj.size || 0,
+        chargedSize: 0,
         uploadedAt,
         expiresAt: uploadedAt ? uploadedAt + cfg.ttlMs : 0,
-        url: `${c.env.PUBLIC_ORIGIN}/i/${id}.${format}`,
+        url: `${env.PUBLIC_ORIGIN}/i/${id}.${format}`,
+        refundsDaily: false,
       })
     }
     cursor = listed.truncated ? listed.cursor : undefined
   } while (cursor && scanned <= MINE_SCAN_CAP)
 
-  items.sort((a, b) => Number(b.uploadedAt) - Number(a.uploadedAt))
+  return items
+}
+
+app.get('/api/mine', async (c) => {
+  const admin = isAdmin(c)
+  const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  const owned = await listOwned(c.env, clientIp(c.req.raw), callerOwnerTag, admin)
+  const items = owned
+    .filter((item) => item.finalized)
+    .sort((a, b) => b.uploadedAt - a.uploadedAt)
+    .map((item) => item.kind === 'doc'
+      ? {
+          kind: 'doc', id: item.id, filename: item.filename, contentType: item.contentType,
+          size: item.size, uploadedAt: item.uploadedAt, expiresAt: item.expiresAt,
+          url: item.url, rawUrl: `${item.url}?raw=1`,
+        }
+      : {
+          kind: 'image', id: item.id, format: item.format, contentType: item.contentType,
+          size: item.size, uploadedAt: item.uploadedAt, expiresAt: item.expiresAt, url: item.url,
+        })
+  c.header('cache-control', 'no-store')
   return c.json({ items, admin })
+})
+
+type RoomItem = Pick<RoomCandidate, 'id' | 'kind' | 'filename' | 'size' | 'uploadedAt'>
+type RoomResult = {
+  fits: boolean
+  need: RoomNeed
+  shortfall: RoomNeed
+  deleted: RoomItem[]
+  wouldDelete: RoomItem[]
+}
+
+const roomItem = ({ id, kind, filename, size, uploadedAt }: RoomCandidate): RoomItem =>
+  ({ id, kind, filename, size, uploadedAt })
+
+// Delete the caller's oldest uploads until one more upload of `bytes` fits
+// under every cap that currently blocks it. Only the caller's own uploads are
+// candidates — the admin key does not widen this to other people's files. When
+// the caller can't free enough, nothing is deleted.
+async function makeRoom(
+  env: Bindings,
+  ip: string,
+  callerOwnerTag: string | undefined,
+  bytes: number,
+  dailyCharged: boolean,
+  dryRun: boolean,
+): Promise<RoomResult> {
+  const cfg = readConfig(env)
+  const [storageUsed, daily] = await Promise.all([getStorageUsed(env.QUOTA), readDailyUsage(env.QUOTA, ip)])
+  const need = computeNeed({
+    bytes,
+    storageUsed,
+    storageCap: cfg.maxTotalBytes,
+    dailyCharged,
+    dailyCount: daily.count,
+    dailyCountMax: cfg.dailyCount,
+    dailyBytes: daily.bytes,
+    dailyBytesMax: cfg.dailyBytes,
+  })
+  const none: RoomNeed = { storageBytes: 0, dailyCount: 0, dailyBytes: 0 }
+  if (!isBlocked(need)) return { fits: true, need, shortfall: none, deleted: [], wouldDelete: [] }
+
+  const cutoff = Date.now() - ABANDONED_PRESIGN_MS
+  const owned = await listOwned(env, ip, callerOwnerTag, false)
+  const candidates = owned.filter((item) => item.finalized || item.uploadedAt < cutoff)
+  const plan = planRoom(candidates, need)
+  const planned = plan.evict.map(roomItem)
+  if (!plan.fits || dryRun) {
+    return { fits: plan.fits, need, shortfall: plan.shortfall, deleted: [], wouldDelete: planned }
+  }
+  for (const item of plan.evict) await deleteUpload(env, item.id, ip, callerOwnerTag)
+  return { fits: true, need, shortfall: plan.shortfall, deleted: planned, wouldDelete: [] }
+}
+
+// Make room for an upload of `bytes` (default 0: just one more upload) by
+// deleting the caller's oldest uploads. `dryRun: true` reports the plan only.
+app.post('/api/make-room', async (c) => {
+  let body: { bytes?: unknown; dryRun?: unknown } = {}
+  const text = await c.req.text()
+  if (text.trim()) {
+    try { body = JSON.parse(text) } catch { return c.json({ error: 'bad_request' }, 400) }
+  }
+  const bytes = Number(body.bytes ?? 0)
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return c.json({ error: 'bad_size', hint: 'bytes must be a non-negative number (the size of the upload you want to fit).' }, 400)
+  }
+  const dryRun = body.dryRun === true
+  const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  const result = await makeRoom(c.env, clientIp(c.req.raw), callerOwnerTag, bytes, !isAdmin(c), dryRun)
+  c.header('cache-control', 'no-store')
+  if (!result.fits) {
+    return c.json({
+      error: 'cannot_make_room',
+      ...result,
+      hint: 'Your own uploads are not enough to free the space needed; nothing was deleted. ' +
+        'Uploads made without your x-owner-token (or from another IP on a previous day) cannot be reclaimed. ' +
+        'Wait for the daily reset or for uploads to expire.',
+    }, 409)
+  }
+  return c.json({ dryRun, ...result })
 })
 
 // Metadata for either an image (id) or a doc (id).
@@ -907,52 +1114,83 @@ app.get('/api/info/:id', async (c) => {
 
 // Delete an image or doc by id. The link/id is the capability — anyone holding
 // it can delete the file (no accounts exist). Frees the global storage counter
-// and refunds the original uploader's daily quota when they delete a file they
-// uploaded today (see refundDaily).
+// and refunds the uploader's daily quota when the uploader (same IP, or the
+// holder of the upload's owner token) deletes a file uploaded today.
+async function deleteUpload(
+  env: Bindings,
+  id: string,
+  ip: string,
+  callerOwnerTag: string | undefined,
+): Promise<{ kind: 'image'; format: ImageFormat } | { kind: 'doc' } | undefined> {
+  const found = await findImage(env.BUCKET, id)
+  if (found) {
+    const size = found.head.size
+    await env.BUCKET.delete(found.key)
+    await env.BUCKET.delete(`img/${id}.ocr.json`)
+    await addStorageUsed(env.QUOTA, -size)
+    return { kind: 'image', format: found.format }
+  }
+
+  const doc = await env.BUCKET.head(`doc/${id}`)
+  const metaObj = await env.BUCKET.get(`meta/${id}.json`)
+  const meta = metaObj ? await metaObj.json<DocMeta>() : undefined
+  if (!doc && !meta) return undefined
+
+  const chargedSize = chargedDocSize(meta, doc?.size ?? 0)
+  const uploadedAt = Number(meta?.uploadedAt ?? 0)
+  const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
+  const callerOwns = !!callerOwnerTag && meta?.ownerTag === callerOwnerTag
+  const finalized = meta?.finalized === true
+  const finalizedSize = finalized ? nonNegative(meta?.size) : 0
+  if (doc) await env.BUCKET.delete(`doc/${id}`)
+  await env.BUCKET.delete(`meta/${id}.json`)
+  // Only un-charge bytes the counter was actually charged (docs are charged
+  // at /finalize). An un-finalized orphan never hit the counter.
+  //
+  // A doc with no meta sidecar is unattributable: we cannot tell whether
+  // /finalize ever charged it, and guessing either way corrupts the counter.
+  // Leave it alone — the half-hourly cron re-sums the bucket and repairs the
+  // value from ground truth (see reconcileStorage in src/storage.ts).
+  if (finalizedSize > 0) await addStorageUsed(env.QUOTA, -finalizedSize)
+  await refundDaily(env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag, callerOwns)
+  return { kind: 'doc' }
+}
+
+async function deleteResponse(c: Context<{ Bindings: Bindings }>, id: string) {
+  const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  const result = await deleteUpload(c.env, id, clientIp(c.req.raw), callerOwnerTag)
+  if (!result) return c.json({ error: 'not_found', hint: 'Already deleted or expired.' }, 404)
+  return c.json({ deleted: true, id, ...result })
+}
+
 app.post('/api/delete', async (c) => {
-  const ip = clientIp(c.req.raw)
   let body: { id?: unknown }
   try {
     body = await c.req.json()
   } catch {
-    return c.json({ error: 'bad_request' }, 400)
+    return c.json({ error: 'bad_request', hint: 'Send JSON: {"id": "<id from the share URL>"}' }, 400)
   }
   const id = String(body.id ?? '')
   if (!isValidId(id)) return c.json({ error: 'bad_id' }, 400)
+  return deleteResponse(c, id)
+})
 
-  const found = await findImage(c.env.BUCKET, id)
-  if (found) {
-    const size = found.head.size
-    await c.env.BUCKET.delete(found.key)
-    await c.env.BUCKET.delete(`img/${id}.ocr.json`)
-    await addStorageUsed(c.env.QUOTA, -size)
-    return c.json({ deleted: true, kind: 'image', format: found.format })
+// `curl -X DELETE <share URL>` — the URL an agent already holds is enough.
+// Browsers can't reach these cross-origin: a DELETE needs a CORS preflight,
+// which /d/ and /i/ never answer, and the Origin check backs that up.
+const deleteByPath = (id: string) => async (c: Context<{ Bindings: Bindings }>) => {
+  if (isForbiddenCrossOrigin(c.req.header('origin'), c.env.PUBLIC_ORIGIN)) {
+    return c.json({ error: 'forbidden_origin' }, 403)
   }
-
-  const doc = await c.env.BUCKET.head(`doc/${id}`)
-  const metaObj = await c.env.BUCKET.get(`meta/${id}.json`)
-  const meta = metaObj ? await metaObj.json<DocMeta>() : undefined
-  if (doc || meta) {
-    const chargedSize = chargedDocSize(meta, doc?.size ?? 0)
-    const uploadedAt = Number(meta?.uploadedAt ?? 0)
-    const uploaderTag = typeof meta?.uploaderTag === 'string' ? meta.uploaderTag : undefined
-    const finalized = meta?.finalized === true
-    const finalizedSize = finalized ? nonNegative(meta?.size) : 0
-    if (doc) await c.env.BUCKET.delete(`doc/${id}`)
-    await c.env.BUCKET.delete(`meta/${id}.json`)
-    // Only un-charge bytes the counter was actually charged (docs are charged
-    // at /finalize). An un-finalized orphan never hit the counter.
-    //
-    // A doc with no meta sidecar is unattributable: we cannot tell whether
-    // /finalize ever charged it, and guessing either way corrupts the counter.
-    // Leave it alone — the half-hourly cron re-sums the bucket and repairs the
-    // value from ground truth (see reconcileStorage in src/storage.ts).
-    if (finalizedSize > 0) await addStorageUsed(c.env.QUOTA, -finalizedSize)
-    await refundDaily(c.env.QUOTA, ip, chargedSize, uploadedAt, uploaderTag)
-    return c.json({ deleted: true, kind: 'doc' })
-  }
-
-  return c.json({ error: 'not_found' }, 404)
+  if (!isValidId(id)) return c.json({ error: 'bad_id' }, 400)
+  return deleteResponse(c, id)
+}
+app.delete('/d/:id/:filename', (c) => deleteByPath(c.req.param('id'))(c))
+app.delete('/d/:id', (c) => deleteByPath(c.req.param('id'))(c))
+app.delete('/i/:filename{[A-Za-z0-9]+\\.(webp|png)}', (c) => {
+  const parsed = parseImageKey(`img/${c.req.param('filename')}`)
+  if (!parsed) return c.json({ error: 'bad_id' }, 400)
+  return deleteByPath(parsed.id)(c)
 })
 
 // ----------------------------------------------------------------------------

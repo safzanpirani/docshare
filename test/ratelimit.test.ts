@@ -4,7 +4,9 @@ import {
   hashIp,
   readDailyUsage,
   refundChargedDaily,
+  dailyResetAt,
   refundDaily,
+  refundsCallerToday,
 } from '../src/ratelimit'
 import { FakeKV, asKV } from './fakes'
 
@@ -36,7 +38,7 @@ describe('checkAndChargeDaily', () => {
     const kv = new FakeKV()
     for (let i = 0; i < 3; i++) await checkAndChargeDaily(asKV(kv), IP, 1, 3, 10_000)
     const res = await checkAndChargeDaily(asKV(kv), IP, 1, 3, 10_000)
-    expect(res).toEqual({ ok: false, reason: 'daily_count', limit: 3 })
+    expect(res).toEqual({ ok: false, reason: 'daily_count', limit: 3, used: 3 })
     expect(await readDailyUsage(asKV(kv), IP)).toEqual({ count: 3, bytes: 3 })
   })
 
@@ -44,7 +46,7 @@ describe('checkAndChargeDaily', () => {
     const kv = new FakeKV()
     await checkAndChargeDaily(asKV(kv), IP, 900, 10, 1000)
     const res = await checkAndChargeDaily(asKV(kv), IP, 200, 10, 1000)
-    expect(res).toEqual({ ok: false, reason: 'daily_bytes', limit: 1000 })
+    expect(res).toEqual({ ok: false, reason: 'daily_bytes', limit: 1000, used: 900 })
     expect(await readDailyUsage(asKV(kv), IP)).toEqual({ count: 1, bytes: 900 })
   })
 
@@ -112,5 +114,32 @@ describe('refundDaily', () => {
     await refundDaily(asKV(kv), IP, 500, 0, await hashIp(IP))
     await refundDaily(asKV(kv), IP, 500, Number.NaN, await hashIp(IP))
     expect(await readDailyUsage(asKV(kv), IP)).toEqual({ count: 1, bytes: 500 })
+  })
+
+  // An owner-token holder on a new network still gets the quota back, and the
+  // refund lands on the counter that was charged, not the caller's.
+  it('refunds the charged counter when the caller owns the upload from another IP', async () => {
+    const kv = new FakeKV()
+    await checkAndChargeDaily(asKV(kv), IP, 500, 5, 10_000)
+    await refundDaily(asKV(kv), OTHER_IP, 500, Date.now(), await hashIp(IP), true)
+    expect(await readDailyUsage(asKV(kv), IP)).toEqual({ count: 0, bytes: 0 })
+    expect(await readDailyUsage(asKV(kv), OTHER_IP)).toEqual({ count: 0, bytes: 0 })
+  })
+})
+
+describe('refundsCallerToday', () => {
+  it('is true only for a same-IP upload from the current UTC day', async () => {
+    const tag = await hashIp(IP)
+    expect(refundsCallerToday(tag, Date.now(), tag)).toBe(true)
+    expect(refundsCallerToday(tag, Date.now(), await hashIp(OTHER_IP))).toBe(false)
+    expect(refundsCallerToday(tag, Date.now() - 3 * 86_400_000, tag)).toBe(false)
+    expect(refundsCallerToday(tag, Date.now(), undefined)).toBe(false)
+  })
+})
+
+describe('dailyResetAt', () => {
+  it('returns the next UTC midnight', () => {
+    expect(dailyResetAt(new Date('2026-03-02T23:59:00Z'))).toBe('2026-03-03T00:00:00.000Z')
+    expect(dailyResetAt(new Date('2026-12-31T00:00:00Z'))).toBe('2027-01-01T00:00:00.000Z')
   })
 })

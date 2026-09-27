@@ -32,21 +32,44 @@ async function quotaKeyForIp(ip: string): Promise<string> {
   return quotaKey(await hashIp(ip))
 }
 
-// Give back one upload's worth of daily quota when the uploader deletes a file
-// they uploaded *today*. Refusing cross-day / cross-IP refunds stops someone
-// farming quota by deleting old or other people's files. Best-effort.
+// Give back one upload's worth of daily quota when a file uploaded *today* is
+// deleted by its uploader. "Uploader" means the same IP, or the holder of the
+// owner token the upload was made with (callerOwns) — so an agent that moved
+// networks can still reclaim what it used. The refund always goes to the
+// counter that was charged: the uploader tag is that counter's key. Refusing
+// cross-day and non-owner refunds stops quota farming by deleting old or other
+// people's files. Best-effort.
 export async function refundDaily(
   kv: KVNamespace,
   ip: string,
   size: number,
   uploadedAt: number,
   uploaderTag: string | undefined,
+  callerOwns = false,
 ): Promise<void> {
   if (!Number.isFinite(uploadedAt) || uploadedAt <= 0) return
   if (utcDay(new Date(uploadedAt)) !== utcDay()) return // only today's counter is live
-  if (!uploaderTag || (await hashIp(ip)) !== uploaderTag) return // only the original uploader
+  if (!uploaderTag) return
+  if (!callerOwns && (await hashIp(ip)) !== uploaderTag) return // only the original uploader
 
-  await refundChargedDaily(kv, ip, size)
+  await refundKey(kv, quotaKey(uploaderTag), size)
+}
+
+// True when deleting an upload made at `uploadedAt` by `uploaderTag` would give
+// quota back to the caller's own current counter (callerIpTag = hashIp(ip)).
+export function refundsCallerToday(
+  callerIpTag: string,
+  uploadedAt: number,
+  uploaderTag: string | undefined,
+): boolean {
+  if (!uploaderTag || !Number.isFinite(uploadedAt) || uploadedAt <= 0) return false
+  return utcDay(new Date(uploadedAt)) === utcDay() && uploaderTag === callerIpTag
+}
+
+// When the daily counters roll over (UTC midnight), as an ISO timestamp.
+export function dailyResetAt(now = new Date()): string {
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1))
+  return next.toISOString()
 }
 
 // Undo a quota charge from the same request/IP after a later upload step fails.
@@ -55,16 +78,24 @@ export async function refundChargedDaily(
   ip: string,
   size: number,
 ): Promise<void> {
-  const cur = await readQuota(kv, ip)
+  await refundKey(kv, await quotaKeyForIp(ip), size)
+}
+
+async function refundKey(kv: KVNamespace, key: string, size: number): Promise<void> {
+  const cur = await readKey(kv, key)
   const next: DailyQuota = {
     count: Math.max(0, cur.count - 1),
     bytes: Math.max(0, cur.bytes - nonNegativeNumber(size)),
   }
-  await kv.put(await quotaKeyForIp(ip), JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
+  await kv.put(key, JSON.stringify(next), { expirationTtl: DAY_TTL_SECONDS })
 }
 
 async function readQuota(kv: KVNamespace, ip: string): Promise<DailyQuota> {
-  const raw = await kv.get(await quotaKeyForIp(ip))
+  return readKey(kv, await quotaKeyForIp(ip))
+}
+
+async function readKey(kv: KVNamespace, key: string): Promise<DailyQuota> {
+  const raw = await kv.get(key)
   if (!raw) return { count: 0, bytes: 0 }
   try {
     const parsed = JSON.parse(raw) as DailyQuota
@@ -89,7 +120,7 @@ export async function readDailyUsage(kv: KVNamespace, ip: string): Promise<Daily
 
 export type QuotaCheck =
   | { ok: true }
-  | { ok: false; reason: 'daily_count' | 'daily_bytes'; limit: number }
+  | { ok: false; reason: 'daily_count' | 'daily_bytes'; limit: number; used: number }
 
 export async function checkAndChargeDaily(
   kv: KVNamespace,
@@ -101,10 +132,10 @@ export async function checkAndChargeDaily(
   const bytesToAdd = nonNegativeNumber(addBytes)
   const cur = await readQuota(kv, ip)
   if (cur.count >= maxCount) {
-    return { ok: false, reason: 'daily_count', limit: maxCount }
+    return { ok: false, reason: 'daily_count', limit: maxCount, used: cur.count }
   }
   if (cur.bytes + bytesToAdd > maxBytes) {
-    return { ok: false, reason: 'daily_bytes', limit: maxBytes }
+    return { ok: false, reason: 'daily_bytes', limit: maxBytes, used: cur.bytes }
   }
   const next: DailyQuota = { count: cur.count + 1, bytes: cur.bytes + bytesToAdd }
   await kv.put(await quotaKeyForIp(ip), JSON.stringify(next), {
