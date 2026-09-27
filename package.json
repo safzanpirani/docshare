@@ -13,12 +13,12 @@
   },
   "dependencies": {
     "aws4fetch": "^1.0.20",
-    "hono": "^4.12.34"
+    "hono": "^4.13.9"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260828.1",
+    "@cloudflare/workers-types": "^5.20260927.1",
     "typescript": "^5.7.2",
     "vitest": "^5.0.2",
-    "wrangler": "^4.127.1"
+    "wrangler": "^4.141.0"
   }
 }
