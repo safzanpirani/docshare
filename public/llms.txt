@@ -118,6 +118,9 @@ matter:
   `x-owner-token` header (any opaque 16–128 char `[A-Za-z0-9_-]` secret you
   mint and reuse); uploads made while sending it are listed back to you. Sent
   no token? You get the uploads made from your IP that carry no owner token.
+  Each item has `matchedBy`: `token` (made with your token), `ip` (an untagged
+  upload from your public IP, which may be someone else's on a shared network),
+  or `admin`. Only bulk-delete `token` items.
   Browsers may only call this (and the delete and make-room endpoints) from
   the app's own origin.
 

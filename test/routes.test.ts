@@ -185,3 +185,16 @@ describe('make room ownership', () => {
     expect(await res.json()).toMatchObject({ error: 'owner_token_required' })
   })
 })
+
+describe('/api/mine matchedBy', () => {
+  it('labels token matches apart from same-IP untagged uploads', async () => {
+    await upload('untagged.txt', 5)
+    await upload('tagged.txt', 5, { token: TOKEN })
+    const res = await call('/api/mine', { headers: { 'x-owner-token': TOKEN } })
+    const { items } = await res.json() as { items: Array<{ filename: string; matchedBy: string }> }
+    expect(Object.fromEntries(items.map((i) => [i.filename, i.matchedBy]))).toEqual({
+      'tagged.txt': 'token',
+      'untagged.txt': 'ip',
+    })
+  })
+})

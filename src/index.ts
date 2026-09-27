@@ -883,6 +883,7 @@ const ABANDONED_PRESIGN_MS = 30 * 60 * 1000
 type OwnedItem = RoomCandidate & {
   // Matched by the caller's owner token, not by the legacy IP fallback.
   byToken: boolean
+  matchedBy: 'token' | 'ip' | 'admin'
   contentType: string
   expiresAt: number
   url: string
@@ -900,6 +901,13 @@ async function listOwned(
   const callerIpTag = await hashIp(ip)
   const owns = (itemOwnerTag: unknown, itemUploaderTag: unknown) =>
     ownsItem({ admin, itemOwnerTag, itemUploaderTag, callerOwnerTag, callerIpTag })
+  // How the caller came to own an item. Clients must not bulk-delete anything
+  // but 'token' matches: an 'ip' match can be a stranger behind the same NAT.
+  const matchedBy = (itemOwnerTag: unknown, itemUploaderTag: unknown): OwnedItem['matchedBy'] => {
+    if (callerOwnerTag && itemOwnerTag === callerOwnerTag) return 'token'
+    if (!itemOwnerTag && itemUploaderTag === callerIpTag) return 'ip'
+    return 'admin'
+  }
 
   const items: OwnedItem[] = []
 
@@ -935,6 +943,7 @@ async function listOwned(
       items.push({
         kind: 'doc', id, filename, finalized,
         byToken: !!callerOwnerTag && meta.ownerTag === callerOwnerTag,
+        matchedBy: matchedBy(meta.ownerTag, meta.uploaderTag),
         contentType: meta.contentType || 'application/octet-stream',
         // Only finalized docs are counted against the storage cap.
         size: finalized ? nonNegative(meta.size) : 0,
@@ -967,6 +976,7 @@ async function listOwned(
       items.push({
         kind: 'image', id, format, filename: `${id}.${format}`, finalized: true,
         byToken: !!callerOwnerTag && cm.ownerTag === callerOwnerTag,
+        matchedBy: matchedBy(cm.ownerTag, cm.uploaderTag),
         contentType: contentTypeFor(format),
         size: obj.size || 0,
         chargedSize: 0,
@@ -993,11 +1003,12 @@ app.get('/api/mine', async (c) => {
       ? {
           kind: 'doc', id: item.id, filename: item.filename, contentType: item.contentType,
           size: item.size, uploadedAt: item.uploadedAt, expiresAt: item.expiresAt,
-          url: item.url, rawUrl: `${item.url}?raw=1`,
+          url: item.url, rawUrl: `${item.url}?raw=1`, matchedBy: item.matchedBy,
         }
       : {
           kind: 'image', id: item.id, format: item.format, contentType: item.contentType,
           size: item.size, uploadedAt: item.uploadedAt, expiresAt: item.expiresAt, url: item.url,
+          matchedBy: item.matchedBy,
         })
   c.header('cache-control', 'no-store')
   return c.json({ items, admin })

@@ -210,7 +210,10 @@ token as the uploader.
 Uploads are attributed by an **owner token**: an opaque secret the client mints
 once and sends as `x-owner-token` on every upload. The server stores only its
 SHA-256, and `/api/mine` returns the uploads whose stored hash matches. Clients
-that send no token (curl, agents) fall back to being matched by IP hash.
+that send no token (curl, agents) fall back to being matched by IP hash. Each
+item carries `matchedBy` (`token`, `ip`, or `admin`); clients should bulk-delete
+only `token` items, since an `ip` match may be a stranger's upload behind the
+same NAT.
 
 The token exists because IP alone is not an identity: behind CGNAT, a corporate
 NAT, or a mobile carrier, unrelated people share a public IP and would otherwise
