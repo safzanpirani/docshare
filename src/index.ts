@@ -156,7 +156,8 @@ app.use('/api/make-room', sameOriginOnly)
 const ROOM_HINT =
   'Free space by deleting your own uploads (POST /api/delete {"id"}, or DELETE on the share URL), ' +
   'or retry with "makeRoom": true in the JSON body / an `x-make-room: 1` header to delete your oldest ' +
-  'uploads automatically (preview with POST /api/make-room {"bytes", "dryRun": true}).'
+  'uploads automatically (preview with POST /api/make-room {"bytes", "dryRun": true}). ' +
+  'Only uploads sent with the same x-owner-token header can be deleted this way.'
 
 function quotaErrorBody(q: { reason: 'daily_count' | 'daily_bytes'; limit: number; used: number }) {
   const what = q.reason === 'daily_count' ? 'upload count' : 'byte'
@@ -880,6 +881,8 @@ const MINE_FETCH_CONCURRENCY = 50
 const ABANDONED_PRESIGN_MS = 30 * 60 * 1000
 
 type OwnedItem = RoomCandidate & {
+  // Matched by the caller's owner token, not by the legacy IP fallback.
+  byToken: boolean
   contentType: string
   expiresAt: number
   url: string
@@ -931,6 +934,7 @@ async function listOwned(
       const uploadedAt = nonNegative(meta.uploadedAt)
       items.push({
         kind: 'doc', id, filename, finalized,
+        byToken: !!callerOwnerTag && meta.ownerTag === callerOwnerTag,
         contentType: meta.contentType || 'application/octet-stream',
         // Only finalized docs are counted against the storage cap.
         size: finalized ? nonNegative(meta.size) : 0,
@@ -962,6 +966,7 @@ async function listOwned(
       const uploadedAt = Number(cm.uploadedAt) || 0
       items.push({
         kind: 'image', id, format, filename: `${id}.${format}`, finalized: true,
+        byToken: !!callerOwnerTag && cm.ownerTag === callerOwnerTag,
         contentType: contentTypeFor(format),
         size: obj.size || 0,
         chargedSize: 0,
@@ -1011,9 +1016,11 @@ const roomItem = ({ id, kind, filename, size, uploadedAt }: RoomCandidate): Room
   ({ id, kind, filename, size, uploadedAt })
 
 // Delete the caller's oldest uploads until one more upload of `bytes` fits
-// under every cap that currently blocks it. Only the caller's own uploads are
-// candidates — the admin key does not widen this to other people's files. When
-// the caller can't free enough, nothing is deleted.
+// under every cap that currently blocks it. Only uploads made with the caller's
+// owner token are candidates: the IP fallback /api/mine uses for untagged
+// uploads would let one person behind a shared NAT evict another's files, and
+// the admin key does not widen the set either. When the caller can't free
+// enough, nothing is deleted.
 async function makeRoom(
   env: Bindings,
   ip: string,
@@ -1036,10 +1043,11 @@ async function makeRoom(
   })
   const none: RoomNeed = { storageBytes: 0, dailyCount: 0, dailyBytes: 0 }
   if (!isBlocked(need)) return { fits: true, need, shortfall: none, deleted: [], wouldDelete: [] }
+  if (!callerOwnerTag) return { fits: false, need, shortfall: need, deleted: [], wouldDelete: [] }
 
   const cutoff = Date.now() - ABANDONED_PRESIGN_MS
   const owned = await listOwned(env, ip, callerOwnerTag, false)
-  const candidates = owned.filter((item) => item.finalized || item.uploadedAt < cutoff)
+  const candidates = owned.filter((item) => item.byToken && (item.finalized || item.uploadedAt < cutoff))
   const plan = planRoom(candidates, need)
   const planned = plan.evict.map(roomItem)
   if (!plan.fits || dryRun) {
@@ -1063,6 +1071,13 @@ app.post('/api/make-room', async (c) => {
   }
   const dryRun = body.dryRun === true
   const callerOwnerTag = await ownerTagFrom(c.req.header(OWNER_TOKEN_HEADER))
+  if (!callerOwnerTag) {
+    return c.json({
+      error: 'owner_token_required',
+      hint: 'Send x-owner-token: <16-128 chars of A-Za-z0-9_-> on your uploads and on this call; ' +
+        'only uploads made with that token can be deleted to make room.',
+    }, 400)
+  }
   const result = await makeRoom(c.env, clientIp(c.req.raw), callerOwnerTag, bytes, !isAdmin(c), dryRun)
   c.header('cache-control', 'no-store')
   if (!result.fits) {
@@ -1070,7 +1085,7 @@ app.post('/api/make-room', async (c) => {
       error: 'cannot_make_room',
       ...result,
       hint: 'Your own uploads are not enough to free the space needed; nothing was deleted. ' +
-        'Uploads made without your x-owner-token (or from another IP on a previous day) cannot be reclaimed. ' +
+        'Only uploads made with this x-owner-token count, and only today\'s uploads from this IP give back daily quota. ' +
         'Wait for the daily reset or for uploads to expire.',
     }, 409)
   }

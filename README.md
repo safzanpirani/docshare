@@ -191,7 +191,10 @@ delete its own uploads to free space:
   either upload route, does the same inline and lists what it removed in
   `evicted` (and the `x-docshare-evicted` header).
 
-Only uploads the caller owns are candidates. The admin key does not widen that.
+Only uploads made with the caller's `x-owner-token` are candidates. Untagged
+uploads that `/api/mine` matches by IP are never deleted this way, and the
+admin key does not widen the set. A call without a token gets
+`400 owner_token_required`.
 For the daily caps, only docs uploaded today from the caller's IP count,
 because only those refund that counter. Presigned uploads abandoned for over
 30 minutes count too. When the caller's uploads cannot free enough, the

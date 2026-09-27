@@ -106,7 +106,8 @@ matter:
 - DELETE /d/:id/:filename or DELETE /i/:id.webp — the same delete, addressed
   by the share URL.
 - POST /api/make-room — body `{bytes, dryRun?}`. Deletes your oldest uploads
-  (only yours, matched by `x-owner-token`) until one more upload of `bytes`
+  (only ones uploaded with the same `x-owner-token`, which is required) until
+  one more upload of `bytes`
   fits under the daily and storage caps. Returns `{fits, deleted, need,
   shortfall}`; with `dryRun: true`, returns `wouldDelete` and deletes nothing.
   The same thing happens inline when an upload sends `x-make-room: 1` (or

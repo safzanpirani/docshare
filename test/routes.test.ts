@@ -164,3 +164,24 @@ describe('delete', () => {
     expect(await mine()).toHaveLength(1)
   })
 })
+
+describe('make room ownership', () => {
+  // Untagged uploads are matched to their IP for listing, but that match is too
+  // weak to justify deleting them automatically.
+  it('never evicts an untagged upload from the same IP', async () => {
+    await upload('untagged.bin', 900_000)
+    const res = await call('/api/make-room', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-owner-token': TOKEN },
+      body: JSON.stringify({ bytes: 500_000 }),
+    })
+    expect(res.status).toBe(409)
+    expect(await (await call('/api/mine')).json()).toMatchObject({ items: [{ filename: 'untagged.bin' }] })
+  })
+
+  it('requires an owner token', async () => {
+    const res = await call('/api/make-room', { method: 'POST', body: '{}' })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'owner_token_required' })
+  })
+})
