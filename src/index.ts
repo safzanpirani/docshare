@@ -542,7 +542,7 @@ app.post('/api/doc/presign', async (c) => {
 
   const cfg = readConfig(c.env)
 
-  let body: { filename?: unknown; size?: unknown; contentType?: unknown; makeRoom?: unknown }
+  let body: { filename?: unknown; size?: unknown; contentType?: unknown; makeRoom?: unknown; force?: unknown }
   try {
     body = await c.req.json()
   } catch {
@@ -553,7 +553,12 @@ app.post('/api/doc/presign', async (c) => {
   const size = Number(body.size ?? 0)
   const contentType = String(body.contentType ?? 'application/octet-stream')
 
-  const maxDoc = isAdmin(c) ? cfg.maxAdminDocBytes : cfg.maxDocBytes
+  // Explicit owner-only override; retain R2 single-PUT and global storage limits.
+  const force = body.force === true
+  if (force && !isAdmin(c)) {
+    return c.json({ error: 'admin_required', hint: '--force requires a valid admin key.' }, 403)
+  }
+  const maxDoc = force ? 5_000_000_000 : isAdmin(c) ? cfg.maxAdminDocBytes : cfg.maxDocBytes
   if (!Number.isFinite(size) || size <= 0) {
     return c.json({ error: 'bad_size', hint: 'Send the exact file size in bytes as a positive number.' }, 400)
   }

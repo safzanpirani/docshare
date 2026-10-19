@@ -282,3 +282,7 @@ without a Workers runtime or network.
 - **Quotas are format-blind.** Stored file byte caps count bytes regardless of
   format. PNG generally uses more storage than WebP; images are not charged
   against the daily document quota.
+
+### Owner-only large uploads
+
+`DOCSHARE_ADMIN_KEY=... docshare --force movie.mp4` (PowerShell: `-Force`) allows an authenticated instance administrator to exceed the normal per-document cap, up to 5,000,000,000 bytes (single PUT ceiling). Non-admin requests are rejected. Global storage capacity, expiry, and finalization size validation remain enforced. Requires deployment of the updated server; an updated CLI alone cannot override the server. Never put a real key in shell history.

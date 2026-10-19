@@ -325,3 +325,32 @@ describe('PNG image cap', () => {
     expect(dimensions.every(([width, height]) => width >= 1 && height >= 1)).toBe(true)
   })
 })
+
+ describe('admin forced document size override', () => {
+  async function forced(size: number, key?: string, force = true) {
+    return call('/api/doc/presign', { method: 'POST',
+      headers: { 'content-type': 'application/json', ...(key ? { 'x-admin-key': key } : {}) },
+      body: JSON.stringify({ filename: 'movie.mp4', size, force }) })
+  }
+  it('rejects unauthenticated force requests', async () => {
+    expect((await forced(2016165423)).status).toBe(403)
+    expect((await forced(2016165423, 'wrong-key')).status).toBe(403)
+  })
+  it('retains the normal admin size cap without force', async () => {
+    expect((await forced(2016165423, env.ADMIN_KEY, false)).status).toBe(413)
+  })
+  it('permits a large admin upload and persists the finalize ceiling', async () => {
+    env.MAX_TOTAL_BYTES = '9000000000'
+    const response = await forced(2016165423, env.ADMIN_KEY)
+    expect(response.status).toBe(200)
+    const { id } = await response.json() as { id: string }
+    const meta = await env.BUCKET.get(`meta/${id}.json`)
+    expect((await meta!.json() as { maxBytes: number }).maxBytes).toBe(5000000000)
+  })
+  it('does not bypass global storage capacity', async () => {
+    expect((await forced(2016165423, env.ADMIN_KEY)).status).toBe(507)
+  })
+  it('enforces the single PUT ceiling even for admins' , async () => {
+    expect((await forced(5000000001, env.ADMIN_KEY)).status).toBe(413)
+  })
+ })

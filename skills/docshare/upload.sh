@@ -38,6 +38,7 @@ usage: docshare [options] <file|dir|->...    upload files, print one URL each;
                                              <bytes> more fits (default: 1 upload)
 
 upload options:
+  --force        admin-only size override (up to 5 GB; storage cap still applies)
   --raw          print the ?raw=1 URL (give this to another agent to read)
   --json         print one JSON object per file: id, url, rawUrl, filename,
                  size, expiresAt
@@ -222,6 +223,7 @@ upload_one() { # upload_one <path> <name>
   # 1) presign — reserves an id without consuming daily quota.
   body="{\"filename\":$(json_str "$name"),\"size\":$size,\"contentType\":$(json_str "$mime")"
   [ "$MAKE_ROOM" = 1 ] && body="$body,\"makeRoom\":true"
+  [ "${FORCE:-0}" = 1 ] && body="$body,\"force\":true"
   body="$body}"
   while :; do
     say "Preparing $name ($(human_size "$size"))"
@@ -309,6 +311,7 @@ cmd_upload() {
   local files=() name="" arg
   while [ $# -gt 0 ]; do
     case "$1" in
+      --force) FORCE=1 ;;
       --raw) RAW=1 ;;
       --json) JSON=1 ;;
       --make-room) MAKE_ROOM=1 ;;

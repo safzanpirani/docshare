@@ -30,6 +30,7 @@
 param(
   [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
   [string[]]$Args_,
+  [switch]$Force,
   [switch]$Raw,
   [switch]$Json,
   [switch]$MakeRoom,
@@ -172,6 +173,7 @@ function Send-File($Path, $FileName) {
 
   # 1) presign — reserves an id without consuming daily quota.
   $body = @{ filename = $FileName; size = $size; contentType = $mime }
+  if ($Force) { $body.force = $true }
   if ($MakeRoom) { $body.makeRoom = $true }
   $waited = 0
   while ($true) {
