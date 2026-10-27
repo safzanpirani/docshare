@@ -1258,10 +1258,16 @@ export class UploadLedger {
 }
 
 export default {
-  fetch: (req: Request, env: Bindings, ctx: ExecutionContext) => {
+  fetch: async (req: Request, env: Bindings, ctx: ExecutionContext) => {
     const path = new URL(req.url).pathname
     if (path === '/internal/reconcile') return new Response(null, { status: 404 })
     if ((req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') || path === '/api/usage' || path === '/api/mine') {
+      // Receive the body before joining the ledger queue: one slow client must not stall
+      // every other upload, finalize, delete and usage request. Oversized declared bodies
+      // go through unread so their route rejects them without buffering.
+      if (req.body && Number(req.headers.get('content-length') ?? '0') <= SIMPLE_UPLOAD_MAX) {
+        req = new Request(req, { body: await req.arrayBuffer() })
+      }
       return env.LEDGER.get(env.LEDGER.idFromName('uploads')).fetch(req)
     }
     return app.fetch(req, env, ctx)

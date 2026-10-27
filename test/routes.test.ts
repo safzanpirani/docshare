@@ -295,6 +295,20 @@ describe('exact upload admission', () => {
     await call('/api/delete', { method: 'POST', body: JSON.stringify({ id }) })
     expect(await (await call('/api/usage')).json()).toMatchObject({ daily: { count: 0, bytes: 0 } })
   })
+
+  it('receives a slow upload body before joining the ledger queue', async () => {
+    const pending = new TransformStream<Uint8Array, Uint8Array>()
+    const slow = call('/upload/file.bin', {
+      method: 'PUT', headers: { 'content-length': '10', accept: 'application/json' },
+      body: pending.readable, duplex: 'half',
+    } as RequestInit)
+    // Usage must answer while the upload body is still open; before the fix it hangs.
+    expect((await call('/api/usage')).status).toBe(200)
+    const writer = pending.writable.getWriter()
+    await writer.write(new Uint8Array(10))
+    await writer.close()
+    expect((await slow).status).toBe(200)
+  })
 })
 
 describe('PNG image cap', () => {
